@@ -1,0 +1,455 @@
+"use client";
+
+import React, { useState, useMemo } from 'react';
+import { 
+  Calculator, PieChart, Settings, Building2, LogOut, 
+  Plus, Trash2, UserPlus, Send, LayoutDashboard, ShieldCheck, 
+  TrendingUp, MapPin, Layers, Edit, ArrowLeft
+} from 'lucide-react';
+
+const REGION_DATA: Record<string, string[]> = {
+  '서울특별시': ['강남구', '강동구', '강북구', '강서구', '관악구', '광진구', '구로구', '금천구', '노원구', '도봉구', '동대문구', '동작구', '마포구', '서대문구', '서초구', '성동구', '성북구', '송파구', '양천구', '영등포구', '용산구', '은평구', '종로구', '중구', '중랑구'],
+  '경기도': ['수원시', '고양시', '용인시', '성남시', '부천시', '화성시', '안산시', '남양주시', '안양시', '평택시', '시흥시', '파주시', '의정부시', '김포시', '광주시', '광명시', '군포시', '하남시', '오산시', '양주시', '이천시', '구리시', '안성시', '포천시', '의왕시', '양평군', '여주시', '동두천시', '가평군', '과천시', '연천군'],
+  '인천광역시': ['계양구', '미추홀구', '남동구', '동구', '부평구', '서구', '연수구', '중구', '강화군', '옹진군'],
+  '충청남도': ['천안시', '공주시', '보령시', '아산시', '서산시', '논산시', '계룡시', '당진시', '금산군', '부여군', '서천군', '청양군', '홍성군', '예산군', '태안군'],
+  '경상북도': ['포항시', '경주시', '김천시', '안동시', '구미시', '영주시', '영천시', '상주시', '문경시', '경산시', '군위군', '의성군', '청송군', '영양군', '영덕군', '청도군', '고령군', '성주군', '칠곡군', '예천군', '봉화군', '울진군', '울릉군'],
+  '부산광역시': ['강서구', '금정구', '기장군', '남구', '동구', '동래구', '부산진구', '북구', '사상구', '사하구', '서구', '수영구', '연제구', '영도구', '중구', '해운대구'],
+};
+
+export default function KyowonMasterERP() {
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [password, setPassword] = useState('');
+  const [activeTab, setActiveTab] = useState('stats');
+
+  const [salaryData, setSalaryData] = useState([
+    { id: 1, academy: '강남학원', name: '홍길동', position: '원장', totalPay: 5200000, totalDeduction: 520000 },
+    { id: 2, academy: '강북학원', name: '이영희', position: '수석강사', totalPay: 4800000, totalDeduction: 480000 },
+  ]);
+
+  const [branches, setBranches] = useState([
+    { id: 'b1', name: '아산지사', regions: [{ id: 'r1', main: '충청남도', sub: '아산시' }] },
+    { id: 'b2', name: '서경기지사', regions: [{ id: 'r2', main: '경기도', sub: '김포시' }, { id: 'r3', main: '경기도', sub: '파주시' }] },
+  ]);
+
+  const [divisions, setDivisions] = useState([
+    { id: 'd1', name: '중부사업단', branchIds: ['b1'] },
+    { id: 'd2', name: '서부사업단', branchIds: ['b2'] },
+  ]);
+
+  const [editingBranchId, setEditingBranchId] = useState<string | null>(null);
+
+  const summary = useMemo(() => {
+    const totalPay = salaryData.reduce((acc, cur) => acc + (Number(cur.totalPay) || 0), 0);
+    const totalDeduction = salaryData.reduce((acc, cur) => acc + (Number(cur.totalDeduction) || 0), 0);
+    return { count: salaryData.length, totalPay, totalDeduction, netPay: totalPay - totalDeduction };
+  }, [salaryData]);
+
+  const handleLogin = () => {
+    if (password === '4968602009') setIsLoggedIn(true);
+    else { alert('⚠️ 접근 권한이 없습니다. 다시 확인해주세요.'); setPassword(''); }
+  };
+
+  // ⭐️ 핵심: Vercel DB로 쏘는 함수
+  const handleSendSalary = async () => {
+    if (salaryData.length === 0) return alert("데이터를 입력해주세요.");
+    const msg = `[직영 급여 명세서 전송 요약]\n\n검토 인원: ${summary.count}명\n합계 급여액: ₩${summary.totalPay.toLocaleString()}\n합계 공제액: ₩${summary.totalDeduction.toLocaleString()}\n━━━━━━━━━━━━━━━━━━━━━━\n최종 실지급액: ₩${summary.netPay.toLocaleString()}\n\n위 데이터를 Vercel DB에 저장하시겠습니까?`;
+    
+    if (window.confirm(msg)) {
+      try {
+        const response = await fetch('/api/salary', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(salaryData),
+        });
+
+        if (response.ok) {
+          alert("🚀 성공! 데이터가 Vercel DB에 안전하게 저장되었습니다.");
+        } else {
+          alert("⚠️ 저장 중 오류가 발생했습니다. DB 연결을 확인해주세요.");
+        }
+      } catch (error) {
+        console.error("통신 에러:", error);
+        alert("⚠️ 네트워크 연결 오류가 발생했습니다.");
+      }
+    }
+  };
+
+  const handleNumberInput = (id: number, field: string, value: string) => {
+    if (/[^0-9,]/.test(value)) return alert("⚠️ 해당 칸에는 숫자만 입력해야 합니다.");
+    const rawNumber = Number(value.replace(/,/g, ''));
+    setSalaryData(salaryData.map(d => d.id === id ? { ...d, [field]: rawNumber } : d));
+  };
+
+  const handleAssignBranch = (divId: string, index: number, newBranchId: string) => {
+    if (!newBranchId) return;
+    const existingDiv = divisions.find(d => d.id !== divId && d.branchIds.includes(newBranchId));
+    if (existingDiv) {
+      alert(`⚠️ 이미 [${existingDiv.name || '다른 사업단'}] 소속입니다.`);
+      return;
+    }
+    const currentDiv = divisions.find(d => d.id === divId);
+    if (currentDiv && currentDiv.branchIds.includes(newBranchId) && currentDiv.branchIds[index] !== newBranchId) {
+      alert(`⚠️ 이미 이 사업단에 추가된 지사입니다.`);
+      return;
+    }
+    const newDivisions = [...divisions];
+    const divIndex = newDivisions.findIndex(d => d.id === divId);
+    newDivisions[divIndex].branchIds[index] = newBranchId;
+    setDivisions(newDivisions);
+  };
+
+  if (!isLoggedIn) {
+    return (
+      <div className="min-h-screen bg-[#020617] flex items-center justify-center p-6 font-sans relative overflow-hidden" translate="no">
+        <div className="absolute top-[-20%] right-[-10%] w-[500px] h-[500px] bg-blue-600/20 rounded-full blur-[120px]" />
+        <div className="absolute bottom-[-10%] left-[-10%] w-[400px] h-[400px] bg-indigo-600/10 rounded-full blur-[100px]" />
+        <div className="bg-white/[0.03] backdrop-blur-2xl p-10 rounded-3xl shadow-2xl w-full max-w-md border border-white/10 text-center relative z-10">
+          <div className="inline-flex p-4 bg-blue-600 rounded-2xl mb-6 shadow-lg shadow-blue-500/20">
+            <ShieldCheck size={28} className="text-white" />
+          </div>
+          <h1 className="text-3xl font-black text-white mb-2 tracking-tight italic">KYOWON</h1>
+          <p className="text-slate-500 font-bold text-xs uppercase tracking-widest mb-10">Security Terminal</p>
+          <input 
+            type="password" value={password} onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && handleLogin()}
+            placeholder="ACCESS KEY" 
+            className="w-full p-5 bg-white/5 border border-white/10 rounded-xl text-center text-xl font-bold text-white placeholder-white/20 focus:bg-white/10 focus:border-blue-500 outline-none transition-all mb-6 tracking-widest"
+          />
+          <button onClick={handleLogin} className="w-full bg-blue-600 text-white py-5 rounded-xl font-bold text-lg hover:bg-blue-500 transition-all active:scale-95">접속하기</button>
+        </div>
+      </div>
+    );
+  }
+
+  const editingBranch = branches.find(b => b.id === editingBranchId);
+
+  return (
+    <div className="min-h-screen bg-[#F8FAFC] text-slate-800 selection:bg-blue-100 font-sans" translate="no">
+      <nav className="bg-white/80 backdrop-blur-md border-b border-slate-200 px-8 h-20 flex items-center justify-between sticky top-0 z-50">
+        <div className="flex items-center gap-12">
+          <div className="flex items-center gap-2 cursor-pointer group" onClick={() => setActiveTab('stats')}>
+            <div className="w-10 h-10 bg-slate-900 rounded-xl flex items-center justify-center text-white group-hover:bg-blue-600 transition-colors shadow-md">
+              <LayoutDashboard size={20} />
+            </div>
+            <span className="font-black text-2xl tracking-tight text-slate-900 italic group-hover:text-blue-600 transition-colors">KYOWON</span>
+          </div>
+          
+          <div className="flex gap-2">
+            {[
+              { id: 'commission', label: '성과 수수료', icon: Calculator },
+              { id: 'stats', label: '통계관리', icon: PieChart },
+              { id: 'org', label: '조직관리', icon: Settings },
+              { id: 'salary', label: '직영 급여 명세서', icon: Building2 },
+            ].map((menu) => (
+              <button 
+                key={menu.id} onClick={() => { setActiveTab(menu.id); setEditingBranchId(null); }}
+                className={`flex items-center gap-2 px-5 py-2.5 rounded-lg font-bold text-sm transition-all ${
+                  activeTab === menu.id ? 'bg-slate-900 text-white shadow-md' : 'text-slate-500 hover:text-slate-900 hover:bg-slate-100'
+                }`}
+              >
+                <menu.icon size={16} /> {menu.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <button onClick={() => setIsLoggedIn(false)} className="flex items-center gap-2 px-4 py-2 text-sm text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all font-bold">
+          <LogOut size={16}/> 로그아웃
+        </button>
+      </nav>
+
+      <main className="max-w-[1400px] mx-auto p-10">
+        <div className="mb-10 flex justify-between items-end">
+          <div>
+            <h2 className="text-3xl font-black text-slate-900 tracking-tight">
+              {activeTab === 'salary' ? '직영 급여 명세서' : activeTab === 'org' ? '조직관리' : activeTab === 'commission' ? '성과 수수료' : '통계 대시보드'}
+            </h2>
+          </div>
+          
+          {activeTab === 'salary' && (
+            <div className="flex gap-3">
+              <button onClick={() => setSalaryData([...salaryData, { id: Date.now(), academy: '', name: '', position: '', totalPay: 0, totalDeduction: 0 }])} className="flex items-center gap-2 bg-white border border-slate-300 px-6 py-3 rounded-xl font-bold text-slate-700 hover:border-blue-600 hover:text-blue-600 transition-all text-sm">
+                <UserPlus size={18} /> 인원 추가 (+)
+              </button>
+              <button onClick={handleSendSalary} className="flex items-center gap-2 bg-blue-600 text-white px-8 py-3 rounded-xl font-bold shadow-lg shadow-blue-200 hover:bg-blue-700 transition-all active:scale-95 text-sm">
+                <Send size={18} /> 발송하기
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* 1. 직영 급여 명세서 */}
+        {activeTab === 'salary' && (
+          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="bg-slate-50 border-b border-slate-200">
+                  <th className="p-5 text-center w-20 text-slate-600 font-black text-sm uppercase">삭제</th>
+                  <th className="p-5 text-slate-600 font-black text-sm uppercase">학원</th>
+                  <th className="p-5 text-slate-600 font-black text-sm uppercase">성명</th>
+                  <th className="p-5 text-slate-600 font-black text-sm uppercase">직급</th>
+                  <th className="p-5 text-right text-slate-600 font-black text-sm uppercase">총 급여액</th>
+                  <th className="p-5 text-right text-slate-600 font-black text-sm uppercase">총 공제액</th>
+                  <th className="p-5 text-right text-blue-600 font-black text-sm uppercase">실지급액</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {salaryData.map(row => (
+                  <tr key={row.id} className="hover:bg-slate-50/50 transition-colors">
+                    <td className="p-4 text-center">
+                      <button onClick={() => setSalaryData(salaryData.filter(d => d.id !== row.id))} className="p-2 text-slate-400 hover:text-red-500 bg-slate-50 hover:bg-red-50 rounded-lg transition-colors"><Trash2 size={18}/></button>
+                    </td>
+                    <td className="p-4"><input className="w-full p-3 bg-transparent outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 rounded-lg font-bold text-sm" value={row.academy} onChange={(e) => setSalaryData(salaryData.map(d => d.id === row.id ? {...d, academy: e.target.value} : d))} placeholder="학원명" /></td>
+                    <td className="p-4"><input className="w-full p-3 bg-transparent outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 rounded-lg font-bold text-sm" value={row.name} onChange={(e) => setSalaryData(salaryData.map(d => d.id === row.id ? {...d, name: e.target.value} : d))} placeholder="성함" /></td>
+                    <td className="p-4"><input className="w-full p-3 bg-transparent outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 rounded-lg font-bold text-sm" value={row.position} onChange={(e) => setSalaryData(salaryData.map(d => d.id === row.id ? {...d, position: e.target.value} : d))} placeholder="직급" /></td>
+                    <td className="p-4"><input type="text" className="w-full text-right p-3 bg-transparent outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 rounded-lg font-bold text-sm" value={row.totalPay === 0 ? '' : row.totalPay.toLocaleString()} onChange={(e) => handleNumberInput(row.id, 'totalPay', e.target.value)} placeholder="0" /></td>
+                    <td className="p-4"><input type="text" className="w-full text-right p-3 bg-transparent outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 rounded-lg font-bold text-sm text-slate-500" value={row.totalDeduction === 0 ? '' : row.totalDeduction.toLocaleString()} onChange={(e) => handleNumberInput(row.id, 'totalDeduction', e.target.value)} placeholder="0" /></td>
+                    <td className="p-4 text-right font-black text-lg text-blue-600">{(row.totalPay - row.totalDeduction).toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* 2. 조직관리 */}
+        {activeTab === 'org' && (
+          <div className="space-y-12 animate-in fade-in">
+            {/* 섹션 A: 사업단 관리 */}
+            <div>
+              <div className="flex justify-between items-center mb-6 border-b border-slate-200 pb-4">
+                <h3 className="text-2xl font-black flex items-center gap-2"><Layers size={24} className="text-blue-600"/> 사업단 관리 <span className="text-sm font-bold text-slate-400 font-normal ml-2">(지사 그룹핑)</span></h3>
+                <button onClick={() => setDivisions([...divisions, { id: `d${Date.now()}`, name: '', branchIds: [] }])} className="bg-slate-800 text-white px-5 py-2.5 rounded-lg font-bold text-sm flex items-center gap-2 hover:bg-slate-900 transition-colors">
+                  <Plus size={16} /> 사업단 추가
+                </button>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                 {divisions.map((div) => (
+                    <div key={div.id} className="bg-white p-8 rounded-2xl border border-slate-200 shadow-sm relative group">
+                      <button onClick={() => setDivisions(divisions.filter(d => d.id !== div.id))} className="absolute top-6 right-6 p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all opacity-0 group-hover:opacity-100"><Trash2 size={18}/></button>
+                      
+                      <div className="border-b border-slate-100 pb-4 mb-6">
+                        <label className="block text-xs font-bold text-blue-600 mb-1">사업단명</label>
+                        <input className="w-full text-xl font-black outline-none bg-transparent placeholder-slate-300 focus:border-blue-200 border-b-2 border-transparent transition-colors pb-1" value={div.name} onChange={(e) => setDivisions(divisions.map(d => d.id === div.id ? {...d, name: e.target.value} : d))} placeholder="사업단 이름을 입력하세요" />
+                      </div>
+                      
+                      <div className="space-y-3">
+                        <div className="flex justify-between items-center">
+                           <label className="text-sm font-bold text-slate-600">소속 지사 목록</label>
+                           <button onClick={() => {
+                              const newDivs = [...divisions];
+                              const idx = newDivs.findIndex(d => d.id === div.id);
+                              newDivs[idx].branchIds.push('');
+                              setDivisions(newDivs);
+                           }} className="text-xs font-bold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-md hover:bg-blue-100">+ 지사 연결</button>
+                        </div>
+                        
+                        {div.branchIds.map((bId, idx) => (
+                          <div key={idx} className="flex gap-2 items-center bg-slate-50 p-2 rounded-lg border border-slate-100">
+                             <select 
+                               className="flex-1 bg-transparent text-sm font-bold outline-none text-slate-700 cursor-pointer"
+                               value={bId}
+                               onChange={(e) => handleAssignBranch(div.id, idx, e.target.value)}
+                             >
+                               <option value="" disabled>지사를 선택해주세요</option>
+                               {branches.map(b => (
+                                 <option key={b.id} value={b.id}>{b.name || '이름 없는 지사'}</option>
+                               ))}
+                             </select>
+                             <button onClick={() => {
+                                const newDivs = [...divisions];
+                                const dIdx = newDivs.findIndex(d => d.id === div.id);
+                                newDivs[dIdx].branchIds.splice(idx, 1);
+                                setDivisions(newDivs);
+                             }} className="p-1.5 text-slate-400 hover:text-red-500 rounded-md hover:bg-white"><Trash2 size={16}/></button>
+                          </div>
+                        ))}
+                        {div.branchIds.length === 0 && <p className="text-xs text-slate-400 italic">등록된 지사가 없습니다.</p>}
+                      </div>
+                    </div>
+                  ))}
+              </div>
+            </div>
+
+            {/* 섹션 B: 지사 관리 */}
+            <div className="pt-8">
+              {!editingBranchId ? (
+                <div>
+                  <div className="flex justify-between items-center mb-6 border-b border-slate-200 pb-4">
+                    <h3 className="text-2xl font-black flex items-center gap-2"><MapPin size={24} className="text-slate-600"/> 지사 관리</h3>
+                    <button onClick={() => {
+                      const newId = `b${Date.now()}`;
+                      setBranches([...branches, { id: newId, name: '', regions: [] }]);
+                      setEditingBranchId(newId);
+                    }} className="bg-white border-2 border-slate-200 text-slate-700 px-5 py-2.5 rounded-lg font-bold text-sm flex items-center gap-2 hover:border-slate-400 transition-colors">
+                      <Plus size={16} /> 지사 생성
+                    </button>
+                  </div>
+                  
+                  <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+                    <table className="w-full text-left border-collapse">
+                      <thead>
+                        <tr className="bg-slate-50 border-b border-slate-200">
+                          <th className="p-5 text-slate-600 font-black text-sm uppercase w-1/4">지사명</th>
+                          <th className="p-5 text-slate-600 font-black text-sm uppercase w-1/2">관리 지역 현황</th>
+                          <th className="p-5 text-right text-slate-600 font-black text-sm uppercase w-1/4">관리</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {branches.map(branch => (
+                          <tr key={branch.id} className="hover:bg-slate-50 transition-colors">
+                            <td className="p-5 font-black text-lg text-slate-800">{branch.name || <span className="text-slate-300 italic">이름 미지정</span>}</td>
+                            <td className="p-5 text-sm font-bold text-slate-500 break-words leading-relaxed">
+                              {branch.regions.length > 0 
+                                ? branch.regions.map(r => `${r.main} ${r.sub}`).join(', ')
+                                : <span className="text-red-400 italic">등록된 지역 없음</span>}
+                            </td>
+                            <td className="p-5 text-right flex justify-end gap-2">
+                              <button onClick={() => setEditingBranchId(branch.id)} className="flex items-center gap-1 px-4 py-2 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 transition-colors text-sm font-black whitespace-nowrap">
+                                <Edit size={16}/> 수정
+                              </button>
+                              <button onClick={() => {
+                                if(window.confirm('지사를 삭제하시겠습니까? 사업단 소속 데이터도 함께 정리됩니다.')) {
+                                  setBranches(branches.filter(b => b.id !== branch.id));
+                                  setDivisions(divisions.map(d => ({...d, branchIds: d.branchIds.filter(id => id !== branch.id)})));
+                                }
+                              }} className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"><Trash2 size={16}/></button>
+                            </td>
+                          </tr>
+                        ))}
+                        {branches.length === 0 && (
+                          <tr><td colSpan={3} className="p-8 text-center text-slate-400 font-bold italic">등록된 지사가 없습니다.</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-xl animate-in zoom-in-95 duration-200">
+                  <div className="flex justify-between items-center mb-8 pb-4 border-b border-slate-100">
+                    <div className="flex items-center gap-4">
+                      <button onClick={() => setEditingBranchId(null)} className="p-2 bg-slate-100 text-slate-600 rounded-full hover:bg-slate-200 transition-colors">
+                        <ArrowLeft size={20} />
+                      </button>
+                      <h3 className="text-2xl font-black text-slate-800">지사 상세 설정</h3>
+                    </div>
+                    <button onClick={() => setEditingBranchId(null)} className="bg-blue-600 text-white px-6 py-2.5 rounded-lg font-bold text-sm hover:bg-blue-700 transition-colors">
+                      완료 (목록으로)
+                    </button>
+                  </div>
+
+                  <div className="space-y-8 max-w-3xl">
+                    <div>
+                      <label className="block text-sm font-black text-slate-700 mb-2">지사명</label>
+                      <input 
+                        className="w-full text-2xl font-black outline-none bg-slate-50 p-4 rounded-xl focus:bg-white focus:ring-2 focus:ring-blue-500 transition-all border border-slate-200" 
+                        value={editingBranch?.name || ''} 
+                        onChange={(e) => setBranches(branches.map(b => b.id === editingBranchId ? {...b, name: e.target.value} : b))} 
+                        placeholder="지사 이름을 입력하세요 (예: 강남지사)" 
+                      />
+                    </div>
+
+                    <div className="bg-slate-50 p-6 rounded-2xl border border-slate-100">
+                      <div className="flex justify-between items-center mb-6">
+                        <div>
+                          <label className="block text-sm font-black text-slate-800">가맹점 관리 지역</label>
+                          <p className="text-xs text-slate-500 mt-1">이 지사가 관할하는 지역(시/도 및 시/군/구)을 선택하세요.</p>
+                        </div>
+                        <button onClick={() => {
+                          const newBranches = [...branches];
+                          const bIdx = newBranches.findIndex(b => b.id === editingBranchId);
+                          newBranches[bIdx].regions.push({ id: `r${Date.now()}`, main: '', sub: '' });
+                          setBranches(newBranches);
+                        }} className="text-sm font-bold text-blue-600 bg-white border border-blue-200 px-4 py-2 rounded-lg hover:bg-blue-50 shadow-sm">+ 지역 추가</button>
+                      </div>
+                      
+                      <div className="space-y-3">
+                        {editingBranch?.regions.map((reg) => (
+                           <div key={reg.id} className="flex gap-3 items-center bg-white p-3 rounded-xl border border-slate-200 shadow-sm hover:border-blue-300 transition-colors">
+                             <MapPin size={18} className="text-slate-300 ml-2" />
+                             
+                             <select 
+                               className="flex-1 text-base font-bold outline-none bg-transparent p-2 border-b-2 border-slate-100 focus:border-blue-400 cursor-pointer"
+                               value={reg.main}
+                               onChange={(e) => {
+                                 const newBranches = [...branches];
+                                 const bIdx = newBranches.findIndex(b => b.id === editingBranchId);
+                                 const rIdx = newBranches[bIdx].regions.findIndex(r => r.id === reg.id);
+                                 newBranches[bIdx].regions[rIdx].main = e.target.value;
+                                 newBranches[bIdx].regions[rIdx].sub = ''; 
+                                 setBranches(newBranches);
+                               }}
+                             >
+                               <option value="" disabled>대분류 선택 (시/도)</option>
+                               {Object.keys(REGION_DATA).map(mainKey => (
+                                 <option key={mainKey} value={mainKey}>{mainKey}</option>
+                               ))}
+                             </select>
+                             
+                             <select 
+                               className="flex-1 text-base font-bold outline-none bg-transparent p-2 border-b-2 border-slate-100 focus:border-blue-400 cursor-pointer disabled:opacity-50"
+                               value={reg.sub}
+                               disabled={!reg.main}
+                               onChange={(e) => {
+                                 const newBranches = [...branches];
+                                 const bIdx = newBranches.findIndex(b => b.id === editingBranchId);
+                                 const rIdx = newBranches[bIdx].regions.findIndex(r => r.id === reg.id);
+                                 newBranches[bIdx].regions[rIdx].sub = e.target.value;
+                                 setBranches(newBranches);
+                               }}
+                             >
+                               <option value="" disabled>{reg.main ? '중분류 선택 (시/군/구)' : '대분류를 먼저 선택하세요'}</option>
+                               {reg.main && REGION_DATA[reg.main]?.map(subKey => (
+                                 <option key={subKey} value={subKey}>{subKey}</option>
+                               ))}
+                             </select>
+                             
+                             <button onClick={() => {
+                                const newBranches = [...branches];
+                                const bIdx = newBranches.findIndex(b => b.id === editingBranchId);
+                                newBranches[bIdx].regions = newBranches[bIdx].regions.filter(r => r.id !== reg.id);
+                                setBranches(newBranches);
+                             }} className="p-3 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"><Trash2 size={18}/></button>
+                           </div>
+                        ))}
+                        {editingBranch?.regions.length === 0 && (
+                          <div className="text-center py-10 bg-white rounded-xl border border-dashed border-slate-300 text-slate-400 font-bold">
+                            등록된 관리 지역이 없습니다. 우측 상단의 '+ 지역 추가' 버튼을 눌러주세요.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* 3. 통계관리 탭 */}
+        {activeTab === 'stats' && (
+          <div className="bg-white rounded-2xl border border-slate-200 p-20 text-center animate-in fade-in">
+             <div className="inline-flex p-5 bg-blue-50 rounded-full mb-6 text-blue-500">
+               <TrendingUp size={48} />
+             </div>
+             <h3 className="text-3xl font-black text-slate-800 mb-4 tracking-tight">전사 실적 통계 대시보드</h3>
+             <p className="text-base font-bold text-slate-500 max-w-md mx-auto leading-relaxed">
+               여기에 교원 ERP의 핵심 그래프와 차트가 표시될 예정입니다.<br/>
+               상단의 다른 탭을 클릭하여 모듈을 확인하세요.
+             </p>
+          </div>
+        )}
+
+        {/* 4. 성과 수수료 탭 */}
+        {activeTab === 'commission' && (
+          <div className="bg-white rounded-2xl border border-slate-200 p-20 text-center animate-in fade-in">
+             <div className="inline-flex p-5 bg-slate-50 rounded-full mb-6 text-slate-400">
+               <Calculator size={48} />
+             </div>
+             <h3 className="text-3xl font-black text-slate-800 mb-4 tracking-tight">성과 수수료</h3>
+             <p className="text-base font-bold text-slate-400">수수료 정산 데이터 연동 대기 중입니다.</p>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
