@@ -39,3 +39,13 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# claude
+.claude/
+
+# logs
+*.log
+*.pid
+*.out.log
+*.err.log
+start-localhost.cmd
