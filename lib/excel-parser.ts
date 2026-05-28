@@ -8,6 +8,12 @@ export interface ParsedSheet {
   missingRequired: string[];
 }
 
+export function parseExcelMatrix(buffer: Buffer): unknown[][] {
+  const workbook = XLSX.read(buffer, { type: "buffer", cellDates: true });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  return XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, defval: null });
+}
+
 function cleanHeader(value: unknown): string {
   return String(value ?? "").trim().replace(/\s+/g, "");
 }

@@ -8,6 +8,7 @@ import {
   isCancelled,
   normalizeOrderType,
   parseExcelByHeader,
+  parseExcelMatrix,
   pick,
 } from "../../../../lib/excel-parser";
 
@@ -43,6 +44,36 @@ function missingAliases(headers: string[], required: string[][]) {
   return required
     .filter((aliases) => !aliases.some((alias) => headerSet.has(alias.replace(/\s+/g, ""))))
     .map((aliases) => aliases[0]);
+}
+
+function legacyOrderRowsFromMatrix(buffer: Buffer) {
+  const matrix = parseExcelMatrix(buffer);
+  const rows: Record<string, unknown>[] = [];
+  for (let index = 0; index < matrix.length; index++) {
+    const cols = matrix[index] || [];
+    const orderDate = cols[1];
+    const orderType = cols[5];
+    const newFlag = cols[6];
+    const merchantCode = cols[9];
+    const grade = cols[12];
+    const quantity = cols[14];
+    const cancelled = cols[17];
+
+    const joined = [orderDate, orderType, merchantCode, quantity].map(cellToStr).join("");
+    if (!joined) continue;
+    if (joined.includes("주문일") || joined.includes("조직코드") || joined.includes("가맹교실ID")) continue;
+
+    rows.push({
+      [ALIASES.orderDate[0]]: orderDate,
+      [ALIASES.orderType[0]]: orderType,
+      [ALIASES.newFlag[0]]: newFlag,
+      [ALIASES.merchantCode[0]]: merchantCode,
+      [ALIASES.grade[0]]: grade,
+      [ALIASES.quantity[0]]: quantity,
+      [ALIASES.cancelled[0]]: cancelled,
+    });
+  }
+  return rows;
 }
 
 async function previewOrders(rows: Record<string, unknown>[], client: any) {
@@ -258,7 +289,7 @@ export async function POST(req: NextRequest) {
     if (!MODE_LABEL[mode]) return NextResponse.json({ message: "업로드 종류가 올바르지 않습니다." }, { status: 400 });
 
     const buffer = Buffer.from(await file.arrayBuffer());
-    const parsed = parseExcelByHeader(buffer, []);
+    let parsed = parseExcelByHeader(buffer, []);
 
     const required =
       mode === "orders"
@@ -268,10 +299,26 @@ export async function POST(req: NextRequest) {
           : [ALIASES.branchName];
     const missingRequired = missingAliases(parsed.headers, required);
     if (missingRequired.length > 0) {
+      if (mode === "orders") {
+        const legacyRows = legacyOrderRowsFromMatrix(buffer);
+        if (legacyRows.length > 0) {
+          parsed = { headers: [], rows: legacyRows, missingRequired: [] };
+        } else {
+          return NextResponse.json(
+            {
+              ok: false,
+              message: `필수 컬럼 없음: ${missingRequired.join(", ")}. 주문 데이터는 정해진 양식 또는 기존 원본 B/F/G/J/M/O/R 열 구조여야 합니다.`,
+              missing_cols: missingRequired,
+            },
+            { status: 400 }
+          );
+        }
+      } else {
       return NextResponse.json(
         { ok: false, message: `필수 컬럼 없음: ${missingRequired.join(", ")}`, missing_cols: missingRequired },
         { status: 400 }
       );
+      }
     }
     if (parsed.rows.length === 0) return NextResponse.json({ message: "데이터 행이 없습니다." }, { status: 400 });
 

@@ -10,6 +10,7 @@ import {
   isCancelled,
   normalizeOrderType,
   parseExcelByHeader,
+  parseExcelMatrix,
   pick,
 } from "../../../../lib/excel-parser";
 
@@ -35,6 +36,36 @@ const ALIASES = {
   regionMajor: ["지역", "대분류", "시도", "major"],
   regionMinor: ["중분류", "시군구", "minor"],
 };
+
+function legacyOrderRowsFromMatrix(buffer: Buffer) {
+  const matrix = parseExcelMatrix(buffer);
+  const rows: Record<string, unknown>[] = [];
+  for (let index = 0; index < matrix.length; index++) {
+    const cols = matrix[index] || [];
+    const orderDate = cols[1];
+    const orderType = cols[5];
+    const newFlag = cols[6];
+    const merchantCode = cols[9];
+    const grade = cols[12];
+    const quantity = cols[14];
+    const cancelled = cols[17];
+
+    const joined = [orderDate, orderType, merchantCode, quantity].map(cellToStr).join("");
+    if (!joined) continue;
+    if (joined.includes("주문일") || joined.includes("조직코드") || joined.includes("가맹교실ID")) continue;
+
+    rows.push({
+      [ALIASES.orderDate[0]]: orderDate,
+      [ALIASES.orderType[0]]: orderType,
+      [ALIASES.newFlag[0]]: newFlag,
+      [ALIASES.merchantCode[0]]: merchantCode,
+      [ALIASES.grade[0]]: grade,
+      [ALIASES.quantity[0]]: quantity,
+      [ALIASES.cancelled[0]]: cancelled,
+    });
+  }
+  return rows;
+}
 
 async function ensureHistory(client: any) {
   await client.query(`
@@ -318,7 +349,11 @@ export async function POST(req: NextRequest) {
     }
 
     const buffer = Buffer.from(await file.arrayBuffer());
-    const { rows } = parseExcelByHeader(buffer, []);
+    let { rows } = parseExcelByHeader(buffer, []);
+    if (mode === "orders") {
+      const legacyRows = legacyOrderRowsFromMatrix(buffer);
+      if (legacyRows.length > 0) rows = legacyRows;
+    }
     if (rows.length === 0) return NextResponse.json({ message: "데이터 행이 없습니다." }, { status: 400 });
 
     client = await pool.connect();
