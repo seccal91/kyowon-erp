@@ -98,14 +98,42 @@ export async function POST(req: NextRequest) {
           continue;
         }
 
-        const parseDate = (s: string): string | null => {
-          if (!s) return null;
-          if (/^\d{1,5}$/.test(s)) {
-            const d = new Date((parseInt(s) - 25569) * 86400 * 1000);
+        const parseDate = (raw: string): string | null => {
+          if (!raw) return null;
+          const cleaned = raw
+            .trim()
+            .replace(/\s+/g, " ")
+            .replace(/\./g, "-")
+            .replace(/T.*$/, "")
+            .replace(/\.0+$/, "")
+            .replace(/\u00A0/g, " ")
+            .replace(/[^0-9\-\/ ]/g, "")
+            .trim();
+
+          if (/^\d{1,5}$/.test(cleaned)) {
+            const d = new Date((parseInt(cleaned, 10) - 25569) * 86400 * 1000);
             return d.toISOString().split("T")[0];
           }
-          const m = s.match(/(\d{4})[-\/]?(\d{2})[-\/]?(\d{2})/);
-          return m ? `${m[1]}-${m[2]}-${m[3]}` : null;
+
+          const isoMatch = cleaned.match(/(\d{4})[-\/ ](\d{1,2})[-\/ ](\d{1,2})/);
+          if (isoMatch) {
+            const year = isoMatch[1];
+            const month = String(Number(isoMatch[2])).padStart(2, "0");
+            const day = String(Number(isoMatch[3])).padStart(2, "0");
+            return `${year}-${month}-${day}`;
+          }
+
+          const compactMatch = cleaned.match(/^(\d{4})(\d{2})(\d{2})$/);
+          if (compactMatch) {
+            return `${compactMatch[1]}-${compactMatch[2]}-${compactMatch[3]}`;
+          }
+
+          const parsed = new Date(cleaned);
+          if (!Number.isNaN(parsed.getTime())) {
+            return parsed.toISOString().split("T")[0];
+          }
+
+          return null;
         };
 
         const contractDate = parseDate(contractDateStr);

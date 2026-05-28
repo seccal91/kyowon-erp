@@ -49,3 +49,5 @@ next-env.d.ts
 *.out.log
 *.err.log
 start-localhost.cmd
+
+.vercel

@@ -44,6 +44,31 @@ export default function OrdersUploadPage() {
     }
   }
 
+  async function parseResponse(res: Response) {
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { ok: false, message: text || res.statusText || `HTTP ${res.status}` };
+    }
+  }
+
+  function normalizeRow(row: any) {
+    return {
+      날짜:
+        row.날짜 ?? row.date ?? row.order_date ?? row.orderDate ?? row["주문일"] ?? row["orderDate"] ?? "",
+      코드:
+        row.코드 ?? row.code ?? row.조직코드 ?? row.merchant_code ?? row.merchantCode ?? "",
+      상품종류:
+        row.상품종류 ?? row.productType ?? row.product_type ?? row.상품유형 ?? row.order_type ?? row.type ?? "",
+      수량: row.수량 ?? row.quantity ?? row.qty ?? 0,
+      취소여부:
+        row.취소여부 ?? row.cancelled ?? row.cancel ?? row.isCancelled ?? row["취소"] ?? "",
+      학년:
+        row.학년 ?? row.grade ?? row.grade_level ?? row.gradeLevel ?? "",
+    };
+  }
+
   async function handleFileUpload(file: File) {
     setUploading(true);
     setMessage(null);
@@ -54,16 +79,17 @@ export default function OrdersUploadPage() {
           const data = e.target?.result as ArrayBuffer;
           const workbook = XLSX.read(data, { type: "array" });
           const sheet = workbook.Sheets[workbook.SheetNames[0]];
-          const rows = XLSX.utils.sheet_to_json(sheet);
+          const rows = XLSX.utils.sheet_to_json(sheet, { raw: false, defval: "" });
+          const payload = rows.map(normalizeRow);
 
           const res = await fetch("/api/orders/upload", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ orders: rows }),
+            body: JSON.stringify({ orders: payload }),
           });
 
-          const result = await res.json();
-          if (res.ok) {
+          const result = await parseResponse(res);
+          if (res.ok && result.ok !== false) {
             setMessage(
               `✓ ${result.inserted}개 반영됨${result.failed > 0 ? ` / ${result.failed}개 실패` : ""}`
             );
@@ -73,6 +99,7 @@ export default function OrdersUploadPage() {
             fetchOrders();
           } else {
             setMessage(result.message || "업로드 실패");
+            console.error("업로드 오류 응답:", result);
           }
         } catch (err) {
           setMessage("파일 처리 중 오류: " + String(err));

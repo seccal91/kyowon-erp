@@ -34,19 +34,28 @@ export interface ParsedRegion {
 
 export function parseAddress(address: string): ParsedRegion | null {
   if (!address) return null;
+  const normalizedAddress = address.replace(/\s+/g, "");
 
   // Try full major name first
   for (const major of Object.keys(REGION_MAP)) {
-    if (address.includes(major)) {
-      const minor = findMinor(address, major);
+    if (normalizedAddress.includes(major.replace(/\s+/g, ""))) {
+      const minor = findMinor(normalizedAddress, major);
       return { major, minor };
     }
   }
 
   // Try alias match
   for (const [alias, major] of Object.entries(MAJOR_ALIASES)) {
-    if (address.includes(alias)) {
-      const minor = findMinor(address, major);
+    if (normalizedAddress.includes(alias.replace(/\s+/g, ""))) {
+      const minor = findMinor(normalizedAddress, major);
+      return { major, minor };
+    }
+  }
+
+  // Fallback: match minor only and infer major
+  for (const major of Object.keys(REGION_MAP)) {
+    const minor = findMinor(normalizedAddress, major);
+    if (minor) {
       return { major, minor };
     }
   }

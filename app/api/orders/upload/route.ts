@@ -1,13 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getToken } from "next-auth/jwt";
+import * as XLSX from "xlsx";
 import pool from "../../../../lib/db";
 
 export const runtime = "nodejs";
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: "16mb",
+    },
+  },
+};
 
-async function ensureTables(client: any) {
-  // orders 테이블 - 상품종류별 수량 집계
+async function ensureSummaryTable(client: any) {
+  // merchant_order_summaries 테이블 - 상품종류별 수량 집계
   await client.query(`
-    CREATE TABLE IF NOT EXISTS orders (
+    CREATE TABLE IF NOT EXISTS merchant_order_summaries (
       id SERIAL PRIMARY KEY,
       merchant_code TEXT NOT NULL,
       year INT NOT NULL,
@@ -20,17 +28,84 @@ async function ensureTables(client: any) {
   `);
 }
 
+function firstValue(row: any, ...keys: string[]) {
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(row, key)) {
+      const value = row[key];
+      if (value !== undefined && value !== null && String(value).trim() !== "") {
+        return value;
+      }
+    }
+  }
+  return undefined;
+}
+
+function firstStr(row: any, ...keys: string[]) {
+  const value = firstValue(row, ...keys);
+  return value === undefined ? "" : String(value).trim();
+}
+
+function firstNum(row: any, ...keys: string[]) {
+  const value = firstValue(row, ...keys);
+  if (value === undefined) return 0;
+  const num = Number(value);
+  return Number.isNaN(num) ? 0 : num;
+}
+
+function parseExcelDate(raw: unknown) {
+  if (raw === undefined || raw === null || raw === "") return null;
+
+  if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
+    return raw;
+  }
+
+  if (typeof raw === "number") {
+    const decoded = XLSX.SSF.parse_date_code(raw);
+    if (decoded) {
+      return new Date(decoded.y, decoded.m - 1, decoded.d);
+    }
+  }
+
+  const text = String(raw).trim();
+  const slug = text.replace(/\./g, "-");
+  const match = slug.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+  if (match) {
+    return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  }
+
+  const compact = text.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (compact) {
+    return new Date(Number(compact[1]), Number(compact[2]) - 1, Number(compact[3]));
+  }
+
+  return null;
+}
+
+function normalizeProductType(rawType: string) {
+  const text = rawType.replace(/\s+/g, "").toLowerCase();
+  if (text.includes("영업") || text.includes("sales") || text.includes("business")) return "영업교재";
+  if (text.includes("정규") || text.includes("regular")) return "정규";
+  if (text.includes("초도") || text.includes("initial")) return "초도";
+  if (text.includes("신규") || text.includes("new")) return "신규";
+  return rawType;
+}
+
+function isCancelled(raw: unknown) {
+  const text = String(raw ?? "").trim().toUpperCase();
+  return text === "Y" || text === "YES" || text === "TRUE" || text === "1" || text.includes("취소");
+}
+
 export async function GET(req: NextRequest) {
   try {
     const client = await pool.connect();
-    await ensureTables(client);
+    await ensureSummaryTable(client);
 
     const merchantCode = req.nextUrl.searchParams.get("merchant_code");
     const year = req.nextUrl.searchParams.get("year");
 
     let query = `
       SELECT merchant_code, year, month, product_counts, total_quantity, created_at
-      FROM orders
+      FROM merchant_order_summaries
       WHERE 1=1
     `;
     const params: any[] = [];
@@ -42,7 +117,7 @@ export async function GET(req: NextRequest) {
 
     if (year) {
       query += ` AND year = $${params.length + 1}`;
-      params.push(parseInt(year));
+      params.push(parseInt(year, 10));
     }
 
     query += ` ORDER BY year DESC, month DESC`;
@@ -72,9 +147,9 @@ export async function POST(req: NextRequest) {
     }
 
     client = await pool.connect();
-    await ensureTables(client);
+    await ensureSummaryTable(client);
 
-    const inserted: number = 0;
+    let inserted = 0;
     const failed: any[] = [];
     const productTypes = ["영업교재", "정규", "초도", "신규"];
 
@@ -83,55 +158,45 @@ export async function POST(req: NextRequest) {
       const rowNum = idx + 2; // Excel 행 번호
 
       try {
-        const dateStr = String(order.날짜 || order["날짜"] || "").trim();
-        const code = String(order.코드 || order["코드"] || "").trim();
-        const productType = String(order.상품종류 || order["상품종류"] || "").trim();
-        const quantityStr = String(order.수량 || order["수량"] || "0").trim();
-        const cancelledStr = String(order.취소여부 || order["취소여부"] || "N").trim().toUpperCase();
+        const dateValue = firstValue(
+          order,
+          "날짜",
+          "date",
+          "주문일",
+          "order_date",
+          "orderDate"
+        );
+        const code = firstStr(order, "코드", "code", "조직코드", "merchant_code", "merchantCode");
+        const productTypeRaw = firstStr(
+          order,
+          "상품종류",
+          "productType",
+          "product_type",
+          "상품유형",
+          "order_type",
+          "type"
+        );
+        const quantity = firstNum(order, "수량", "quantity", "qty", "quantity", "수량합");
+        const cancelledValue = firstValue(order, "취소여부", "cancelled", "cancel", "isCancelled", "취소");
 
-        if (!dateStr || !code || !productType) {
+        const parsedDate = parseExcelDate(dateValue);
+        if (!parsedDate || !code || !productTypeRaw) {
           failed.push({ row: rowNum, error: "날짜, 코드, 상품종류 필수" });
           continue;
         }
 
-        // 날짜 파싱
-        let year: number, month: number;
-        if (/^\d{1,5}$/.test(dateStr)) {
-          // Excel 날짜 번호
-          const excelDate = parseInt(dateStr);
-          const jsDate = new Date((excelDate - 25569) * 86400 * 1000);
-          year = jsDate.getFullYear();
-          month = jsDate.getMonth() + 1;
-        } else {
-          const match = dateStr.match(/(\d{4})[-\/]?(\d{2})[-\/]?(\d{2})/);
-          if (match) {
-            year = parseInt(match[1]);
-            month = parseInt(match[2]);
-          } else {
-            failed.push({ row: rowNum, error: "날짜 형식 오류" });
-            continue;
-          }
-        }
-
-        // 수량 파싱
-        const quantity = parseInt(quantityStr) || 0;
-
-        // 취소 여부
-        const isCancelled = cancelledStr === "Y";
-
-        // 상품종류 정규화
-        let normalizedType = productType;
+        const year = parsedDate.getFullYear();
+        const month = parsedDate.getMonth() + 1;
+        const normalizedType = normalizeProductType(productTypeRaw);
         if (!productTypes.includes(normalizedType)) {
-          failed.push({ row: rowNum, error: `알 수 없는 상품종류: ${productType}` });
+          failed.push({ row: rowNum, error: `알 수 없는 상품종류: ${productTypeRaw}` });
           continue;
         }
 
-        // 취소 주문은 수량 차감
-        const qty = isCancelled ? -quantity : quantity;
+        const qty = isCancelled(cancelledValue) ? -quantity : quantity;
 
-        // 기존 데이터 조회
         const existingRes = await client.query(
-          `SELECT product_counts, total_quantity FROM orders 
+          `SELECT product_counts, total_quantity FROM merchant_order_summaries 
            WHERE merchant_code = $1 AND year = $2 AND month = $3`,
           [code, year, month]
         );
@@ -150,14 +215,12 @@ export async function POST(req: NextRequest) {
           totalQty = existing.total_quantity || 0;
         }
 
-        // 수량 업데이트
         productCounts[normalizedType as keyof typeof productCounts] =
           (productCounts[normalizedType as keyof typeof productCounts] || 0) + qty;
         totalQty += qty;
 
-        // UPSERT
         await client.query(
-          `INSERT INTO orders (merchant_code, year, month, product_counts, total_quantity)
+          `INSERT INTO merchant_order_summaries (merchant_code, year, month, product_counts, total_quantity)
            VALUES ($1, $2, $3, $4, $5)
            ON CONFLICT (merchant_code, year, month) DO UPDATE
            SET product_counts = EXCLUDED.product_counts, total_quantity = EXCLUDED.total_quantity`,
@@ -169,7 +232,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    client.release();
+    if (client) client.release();
 
     return NextResponse.json({
       ok: true,

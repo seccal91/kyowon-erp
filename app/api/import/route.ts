@@ -25,6 +25,19 @@ function readExcelRaw(buffer: Buffer): RawExcelRow[] {
   return XLSX.utils.sheet_to_json<RawExcelRow>(sheet, { header: 1, defval: "" });
 }
 
+function cleanCell(raw: unknown) {
+  if (raw === undefined || raw === null) return "";
+  const text = String(raw);
+  return text
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&amp;/gi, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function firstStr(row: ExcelRow, ...keys: string[]): string {
   for (const key of keys) {
     const value = row[key];
@@ -69,7 +82,7 @@ function parseExcelDate(raw: unknown): ParsedDate | null {
     };
   }
 
-  const text = String(raw).trim();
+  const text = cleanCell(raw);
   const dashed = text.match(/^(\d{4})[-/.](\d{1,2})(?:[-/.](\d{1,2}))?/);
   if (dashed) {
     const year = Number(dashed[1]);
@@ -100,24 +113,25 @@ function parseExcelDate(raw: unknown): ParsedDate | null {
 }
 
 function normalizeOrderType(rawType: unknown, rawNewFlag: unknown) {
-  const orderType = String(rawType ?? "").replace(/\s+/g, "").trim();
-  const newFlag = String(rawNewFlag ?? "").trim().toUpperCase();
+  const orderType = cleanCell(rawType).replace(/\s+/g, "").toLowerCase();
+  const newFlag = cleanCell(rawNewFlag).toUpperCase();
 
   if (orderType.includes("초도")) return "초도";
-  if (orderType.includes("영업교재")) return "영업교재";
-  if (orderType.includes("신규") || orderType.includes("복회")) {
+  if (orderType.includes("영업교재") || orderType.includes("영업")) return "영업교재";
+  if (orderType.includes("신규") || orderType.includes("new") || orderType.includes("복회")) {
     return newFlag === "Y" ? "신규" : "복회";
   }
-  if (orderType.includes("정규")) return "정규";
+  if (orderType.includes("정규") || orderType.includes("regular")) return "정규";
   return orderType || "정규";
 }
 
 function isCancelled(raw: unknown) {
-  return String(raw ?? "").replace(/\s+/g, "").includes("취소완료");
+  const value = cleanCell(raw).toUpperCase();
+  return value.includes("취소완료") || value.includes("취소") || value === "Y" || value === "YES";
 }
 
 function isHeaderRow(cols: RawExcelRow) {
-  const joined = cols.map((value) => String(value ?? "")).join("|");
+  const joined = cols.map((value) => cleanCell(value)).join("|");
   return joined.includes("주문일") || joined.includes("조직코드") || joined.includes("수량");
 }
 
@@ -320,9 +334,9 @@ async function importOrders(buffer: Buffer, client: any) {
 
     const parsedDate = parseExcelDate(cols[1]); // B: 주문일
     const orderType = normalizeOrderType(cols[5], cols[6]); // F/G
-    const merchantCode = String(cols[9] ?? "").trim(); // J: 조직코드
-    const grade = String(cols[12] ?? "").trim(); // M: 학년
-    const quantity = Number(cols[14]) || 0; // O: 수량
+    const merchantCode = cleanCell(cols[9]); // J: 조직코드
+    const grade = cleanCell(cols[12]); // M: 학년
+    const quantity = Number(cleanCell(cols[14])) || 0; // O: 수량
     const wasCancelled = isCancelled(cols[17]); // R: 취소여부
 
     if (!parsedDate || !merchantCode || quantity === 0) {
