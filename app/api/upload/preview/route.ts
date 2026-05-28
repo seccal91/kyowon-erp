@@ -1,18 +1,117 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getToken } from "next-auth/jwt";
 import pool from "../../../../lib/db";
-import { parseExcelByHeader, cellToStr, cellToDate, cellToNum } from "../../../../lib/excel-parser";
+import {
+  cellToDate,
+  cellToNum,
+  cellToStr,
+  isCancelled,
+  normalizeOrderType,
+  parseExcelByHeader,
+  pick,
+} from "../../../../lib/excel-parser";
 
 export const runtime = "nodejs";
 
-// ─── Mode configs ────────────────────────────────────────────────────────────
-const MODE_REQUIRED: Record<string, string[]> = {
-  merchants: ["조직코드"],
-  orders:    ["가맹교실ID", "주문일", "수량"],
-  branches:  ["지사명"],
+type Mode = "merchants" | "orders" | "branches";
+
+const MODE_LABEL: Record<Mode, string> = {
+  merchants: "가맹점",
+  orders: "주문",
+  branches: "지사",
 };
 
-// ─── Per-mode preview builders ────────────────────────────────────────────────
+const ALIASES = {
+  merchantCode: ["조직코드", "가맹교실ID", "가맹점코드", "코드", "merchant_code", "code"],
+  merchantName: ["교실명", "가맹점명", "가맹교실명", "상호", "name"],
+  address: ["주소", "address"],
+  contractDate: ["계약일", "계약일자", "contract_date"],
+  terminationDate: ["해지일자", "해지일", "termination_date"],
+  orderDate: ["주문일", "주문일자", "주문연도월일", "order_date", "date"],
+  orderType: ["주문구분", "주문종류", "주문유형", "order_type", "type"],
+  quantity: ["수량", "주문수", "quantity", "qty"],
+  cancelled: ["취소여부", "취소", "cancelled"],
+  grade: ["학년", "grade"],
+  newFlag: ["신규여부", "신규", "new_flag"],
+  branchName: ["지사명", "branch", "branch_name"],
+  regionMajor: ["지역", "대분류", "시도", "major"],
+  regionMinor: ["중분류", "시군구", "minor"],
+};
+
+function missingAliases(headers: string[], required: string[][]) {
+  const headerSet = new Set(headers.map((h) => h.replace(/\s+/g, "")));
+  return required
+    .filter((aliases) => !aliases.some((alias) => headerSet.has(alias.replace(/\s+/g, ""))))
+    .map((aliases) => aliases[0]);
+}
+
+async function previewOrders(rows: Record<string, unknown>[], client: any) {
+  const newRows: any[] = [];
+  const errorRows: any[] = [];
+
+  const codes = [...new Set(rows.map((row) => cellToStr(pick(row, ALIASES.merchantCode))).filter(Boolean))];
+  const knownCodes = new Set<string>();
+  if (codes.length > 0) {
+    const res = await client.query(
+      `SELECT merchant_code FROM merchant_mappings WHERE merchant_code = ANY($1)`,
+      [codes]
+    );
+    for (const row of res.rows) knownCodes.add(row.merchant_code);
+  }
+
+  rows.forEach((row, index) => {
+    const code = cellToStr(pick(row, ALIASES.merchantCode));
+    const orderDate = cellToDate(pick(row, ALIASES.orderDate));
+    const qty = cellToNum(pick(row, ALIASES.quantity));
+    const rawType = pick(row, ALIASES.orderType);
+    const orderType = normalizeOrderType(rawType, pick(row, ALIASES.newFlag));
+    const cancelled = isCancelled(pick(row, ALIASES.cancelled));
+    const grade = cellToStr(pick(row, ALIASES.grade));
+
+    const reasons: string[] = [];
+    if (!code) reasons.push("조직코드 누락");
+    if (!orderDate) reasons.push("주문일 파싱 실패");
+    if (!cellToStr(rawType)) reasons.push("주문구분 누락");
+    if (qty === null || qty === 0) reasons.push("수량 없음");
+
+    if (reasons.length > 0) {
+      errorRows.push({
+        rowNum: index + 2,
+        reason: reasons.join(", "),
+        data: {
+          조직코드: code,
+          주문일: cellToStr(pick(row, ALIASES.orderDate)),
+          주문구분: cellToStr(rawType),
+          수량: cellToStr(pick(row, ALIASES.quantity)),
+        },
+      });
+      return;
+    }
+
+    newRows.push({
+      rowNum: index + 2,
+      key: code,
+      after: {
+        조직코드: code,
+        주문일: orderDate,
+        주문구분: orderType,
+        수량: qty,
+        취소여부: cancelled ? "취소완료" : "",
+        학년: grade || "",
+        가맹점매핑: knownCodes.has(code) ? "등록됨" : "미등록",
+      },
+    });
+  });
+
+  return {
+    mode: "orders",
+    stats: { new: newRows.length, update: 0, error: errorRows.length, skip: 0 },
+    new_rows: newRows.slice(0, 200),
+    update_rows: [],
+    error_rows: errorRows.slice(0, 200),
+    total_rows: rows.length,
+  };
+}
 
 async function previewMerchants(rows: Record<string, unknown>[], client: any) {
   const newRows: any[] = [];
@@ -20,54 +119,61 @@ async function previewMerchants(rows: Record<string, unknown>[], client: any) {
   const errorRows: any[] = [];
   const skipRows: any[] = [];
 
-  const codes = rows.map(r => cellToStr(r["조직코드"])).filter(Boolean);
+  const codes = rows.map((row) => cellToStr(pick(row, ALIASES.merchantCode))).filter(Boolean);
   const existing: Record<string, any> = {};
-  if (codes.length) {
+  if (codes.length > 0) {
     const res = await client.query(
       `SELECT merchant_code, name, status, contract_date, termination_date FROM merchants WHERE merchant_code = ANY($1)`,
       [codes]
     );
-    for (const r of res.rows) existing[r.merchant_code] = r;
+    for (const row of res.rows) existing[row.merchant_code] = row;
   }
 
-  rows.forEach((row, i) => {
-    const code = cellToStr(row["조직코드"]);
-    const name = cellToStr(row["교실명"] ?? row["가맹점명"] ?? null);
-    const contractDate = cellToDate(row["계약일"]);
-    const termDate = cellToDate(row["해지일자"]);
-    const status = termDate ? "terminated" : "active";
+  rows.forEach((row, index) => {
+    const code = cellToStr(pick(row, ALIASES.merchantCode));
+    const name = cellToStr(pick(row, ALIASES.merchantName));
+    const address = cellToStr(pick(row, ALIASES.address));
+    const contractDate = cellToDate(pick(row, ALIASES.contractDate));
+    const terminationDate = cellToDate(pick(row, ALIASES.terminationDate));
+    const status = terminationDate ? "해지" : "정상";
 
-    if (!code) { errorRows.push({ rowNum: i + 2, reason: "조직코드 누락", data: row }); return; }
+    if (!code) {
+      errorRows.push({ rowNum: index + 2, reason: "조직코드 누락", data: row });
+      return;
+    }
 
-    const after: Record<string, any> = {};
-    if (name) after["교실명"] = name;
-    if (contractDate) after["계약일"] = contractDate;
-    if (termDate) after["해지일자"] = termDate;
-    after["상태"] = status;
+    const after: Record<string, unknown> = { 조직코드: code };
+    if (name) after.교실명 = name;
+    if (address) after.주소 = address;
+    if (contractDate) after.계약일 = contractDate;
+    if (terminationDate) after.해지일자 = terminationDate;
+    after.상태 = status;
 
-    const prev = existing[code];
-    if (!prev) {
-      if (!name) { errorRows.push({ rowNum: i + 2, reason: "교실명 누락 (신규 등록 불가)", data: row }); return; }
-      newRows.push({ rowNum: i + 2, key: code, after });
-    } else {
-      const before: Record<string, any> = {
-        "교실명": prev.name,
-        "계약일": prev.contract_date ? String(prev.contract_date).split("T")[0] : null,
-        "해지일자": prev.termination_date ? String(prev.termination_date).split("T")[0] : null,
-        "상태": prev.status,
-      };
-      const changes: Record<string, { from: any; to: any }> = {};
-      for (const [k, v] of Object.entries(after)) {
-        if (v !== null && v !== "" && String(v) !== String(before[k] ?? "")) {
-          changes[k] = { from: before[k], to: v };
-        }
+    const previous = existing[code];
+    if (!previous) {
+      if (!name) {
+        errorRows.push({ rowNum: index + 2, reason: "신규 등록에는 교실명이 필요합니다.", data: row });
+        return;
       }
-      if (Object.keys(changes).length === 0) {
-        skipRows.push({ rowNum: i + 2, key: code });
-      } else {
-        updateRows.push({ rowNum: i + 2, key: code, before, after, changes });
+      newRows.push({ rowNum: index + 2, key: code, after });
+      return;
+    }
+
+    const before: Record<string, unknown> = {
+      교실명: previous.name,
+      계약일: previous.contract_date ? String(previous.contract_date).split("T")[0] : "",
+      해지일자: previous.termination_date ? String(previous.termination_date).split("T")[0] : "",
+      상태: previous.status === "terminated" ? "해지" : "정상",
+    };
+    const changes: Record<string, { from: unknown; to: unknown }> = {};
+    for (const [key, value] of Object.entries(after)) {
+      if (key === "조직코드") continue;
+      if (value !== "" && value !== null && String(value) !== String(before[key] ?? "")) {
+        changes[key] = { from: before[key] ?? "", to: value };
       }
     }
+    if (Object.keys(changes).length === 0) skipRows.push({ rowNum: index + 2, key: code });
+    else updateRows.push({ rowNum: index + 2, key: code, before, after, changes });
   });
 
   return {
@@ -80,118 +186,51 @@ async function previewMerchants(rows: Record<string, unknown>[], client: any) {
   };
 }
 
-async function previewOrders(rows: Record<string, unknown>[], client: any) {
-  const validRows: any[] = [];
-  const errorRows: any[] = [];
-
-  // Load known merchant codes for validation
-  const allCodes = [...new Set(rows.map(r => cellToStr(r["가맹교실ID"])).filter(Boolean))];
-  const knownCodes = new Set<string>();
-  if (allCodes.length) {
-    const res = await client.query(
-      `SELECT merchant_code FROM merchant_mappings WHERE merchant_code = ANY($1)`,
-      [allCodes]
-    );
-    for (const r of res.rows) knownCodes.add(r.merchant_code);
-  }
-
-  rows.forEach((row, i) => {
-    const code = cellToStr(row["가맹교실ID"]);
-    const orderDate = cellToDate(row["주문일"]);
-    const qty = cellToNum(row["수량"]);
-    const orderTypeRaw = cellToStr(row["주문구분"]);
-    const isNew = cellToStr(row["신규여부"]).toUpperCase();
-    const cancelRaw = cellToStr(row["취소여부"]);
-    const grade = cellToStr(row["학년"]);
-
-    const reasons: string[] = [];
-    if (!code) reasons.push("가맹교실ID 누락");
-    if (!orderDate) reasons.push("주문일 파싱 실패");
-    if (qty === null || qty === 0) reasons.push("수량 없음");
-
-    if (reasons.length) {
-      errorRows.push({ rowNum: i + 2, reason: reasons.join(", "), data: { 가맹교실ID: code, 주문일: cellToStr(row["주문일"]), 수량: row["수량"] } });
-      return;
-    }
-
-    let orderType: string;
-    if (orderTypeRaw === "초도") orderType = "초도";
-    else if (orderTypeRaw === "영업교재") orderType = "영업교재";
-    else if (orderTypeRaw === "정규") orderType = "정규";
-    else if (orderTypeRaw === "신규복회" || orderTypeRaw === "신규/복회") {
-      orderType = isNew === "Y" ? "신규" : "복회";
-    } else orderType = orderTypeRaw || "정규";
-
-    const cancelled = cancelRaw === "취소완료";
-    const unknownMerchant = !knownCodes.has(code);
-
-    validRows.push({
-      rowNum: i + 2,
-      after: {
-        가맹교실ID: code,
-        주문일: orderDate,
-        주문구분: orderType,
-        학년: grade || null,
-        수량: qty,
-        취소: cancelled ? "취소" : "",
-        미매핑: unknownMerchant ? "⚠ 미등록 가맹점" : "",
-      },
-    });
-  });
-
-  return {
-    mode: "orders",
-    stats: { new: validRows.length, update: 0, error: errorRows.length, skip: 0 },
-    new_rows: validRows.slice(0, 200),
-    update_rows: [],
-    error_rows: errorRows.slice(0, 200),
-    total_rows: rows.length,
-  };
-}
-
 async function previewBranches(rows: Record<string, unknown>[], client: any) {
   const newRows: any[] = [];
   const updateRows: any[] = [];
   const errorRows: any[] = [];
   const skipRows: any[] = [];
 
-  const names = rows.map(r => cellToStr(r["지사명"])).filter(Boolean);
+  const names = rows.map((row) => cellToStr(pick(row, ALIASES.branchName))).filter(Boolean);
   const existing: Record<string, any> = {};
-  if (names.length) {
-    const res = await client.query(
-      `SELECT id, name, regions, group_name FROM organizations WHERE name = ANY($1)`,
-      [names]
-    );
-    for (const r of res.rows) existing[r.name] = r;
+  if (names.length > 0) {
+    const res = await client.query(`SELECT id, name, regions FROM organizations WHERE name = ANY($1)`, [names]);
+    for (const row of res.rows) existing[row.name] = row;
   }
 
-  rows.forEach((row, i) => {
-    const name = cellToStr(row["지사명"]);
-    const region = cellToStr(row["지역"] ?? row["대분류"] ?? null);
-    const minor = cellToStr(row["중분류"] ?? null);
+  rows.forEach((row, index) => {
+    const name = cellToStr(pick(row, ALIASES.branchName));
+    const major = cellToStr(pick(row, ALIASES.regionMajor));
+    const minor = cellToStr(pick(row, ALIASES.regionMinor));
 
-    if (!name) { errorRows.push({ rowNum: i + 2, reason: "지사명 누락", data: row }); return; }
+    if (!name) {
+      errorRows.push({ rowNum: index + 2, reason: "지사명 누락", data: row });
+      return;
+    }
 
-    const after: Record<string, any> = { 지사명: name };
-    if (region) after["지역"] = region;
-    if (minor) after["중분류"] = minor;
+    const after = { 지사명: name, 대분류: major, 중분류: minor };
+    const previous = existing[name];
+    if (!previous) {
+      newRows.push({ rowNum: index + 2, key: name, after });
+      return;
+    }
 
-    const prev = existing[name];
-    if (!prev) {
-      newRows.push({ rowNum: i + 2, key: name, after });
+    const currentRegions = (previous.regions ?? [])
+      .map((region: any) => `${region.major}${region.minor ? ` ${region.minor}` : ""}`)
+      .join(", ");
+    const nextRegion = major ? `${major}${minor ? ` ${minor}` : ""}` : "";
+
+    if (nextRegion && !currentRegions.includes(nextRegion)) {
+      updateRows.push({
+        rowNum: index + 2,
+        key: name,
+        before: { 지역: currentRegions },
+        after: { 지역: currentRegions ? `${currentRegions}, ${nextRegion}` : nextRegion },
+        changes: { 지역: { from: currentRegions, to: `${nextRegion} 추가` } },
+      });
     } else {
-      const existingRegions = (prev.regions ?? []).map((r: any) => `${r.major}${r.minor ? " " + r.minor : ""}`).join(", ");
-      const newRegion = region ? `${region}${minor ? " " + minor : ""}` : "";
-      if (newRegion && !existingRegions.includes(region)) {
-        updateRows.push({
-          rowNum: i + 2, key: name,
-          before: { 지역: existingRegions },
-          after: { 지역: existingRegions ? `${existingRegions}, ${newRegion}` : newRegion },
-          changes: { 지역: { from: existingRegions, to: newRegion + " 추가" } },
-        });
-      } else {
-        skipRows.push({ rowNum: i + 2, key: name });
-      }
+      skipRows.push({ rowNum: index + 2, key: name });
     }
   });
 
@@ -205,44 +244,49 @@ async function previewBranches(rows: Record<string, unknown>[], client: any) {
   };
 }
 
-// ─── Route ────────────────────────────────────────────────────────────────────
 export async function POST(req: NextRequest) {
   const token = await getToken({ req, secret: process.env.NEXTAUTH_SECRET });
   if (!token) return NextResponse.json({ message: "권한 없음" }, { status: 401 });
 
   let client;
   try {
-    const fd = await req.formData();
-    const file = fd.get("file");
-    const mode = String(fd.get("mode") || "");
+    const formData = await req.formData();
+    const file = formData.get("file");
+    const mode = String(formData.get("mode") || "") as Mode;
 
-    if (!file || !(file instanceof File)) return NextResponse.json({ message: "파일 없음" }, { status: 400 });
-    if (!MODE_REQUIRED[mode]) return NextResponse.json({ message: "mode 오류" }, { status: 400 });
+    if (!file || !(file instanceof File)) return NextResponse.json({ message: "파일이 없습니다." }, { status: 400 });
+    if (!MODE_LABEL[mode]) return NextResponse.json({ message: "업로드 종류가 올바르지 않습니다." }, { status: 400 });
 
     const buffer = Buffer.from(await file.arrayBuffer());
-    const { rows, missingRequired } = parseExcelByHeader(buffer, MODE_REQUIRED[mode]);
+    const parsed = parseExcelByHeader(buffer, []);
 
-    if (missingRequired.length) {
-      return NextResponse.json({
-        ok: false,
-        missing_cols: missingRequired,
-        message: `필수 컬럼 없음: ${missingRequired.join(", ")}`,
-      }, { status: 400 });
+    const required =
+      mode === "orders"
+        ? [ALIASES.merchantCode, ALIASES.orderDate, ALIASES.orderType, ALIASES.quantity]
+        : mode === "merchants"
+          ? [ALIASES.merchantCode]
+          : [ALIASES.branchName];
+    const missingRequired = missingAliases(parsed.headers, required);
+    if (missingRequired.length > 0) {
+      return NextResponse.json(
+        { ok: false, message: `필수 컬럼 없음: ${missingRequired.join(", ")}`, missing_cols: missingRequired },
+        { status: 400 }
+      );
     }
-
-    if (!rows.length) return NextResponse.json({ message: "데이터 없음" }, { status: 400 });
+    if (parsed.rows.length === 0) return NextResponse.json({ message: "데이터 행이 없습니다." }, { status: 400 });
 
     client = await pool.connect();
-
-    let result: any;
-    if (mode === "merchants") result = await previewMerchants(rows, client);
-    else if (mode === "orders") result = await previewOrders(rows, client);
-    else result = await previewBranches(rows, client);
+    const result =
+      mode === "orders"
+        ? await previewOrders(parsed.rows, client)
+        : mode === "merchants"
+          ? await previewMerchants(parsed.rows, client)
+          : await previewBranches(parsed.rows, client);
 
     return NextResponse.json({ ok: true, filename: file.name, ...result });
-  } catch (err) {
-    console.error("preview error:", err);
-    return NextResponse.json({ message: String(err) }, { status: 500 });
+  } catch (error) {
+    console.error("upload preview error:", error);
+    return NextResponse.json({ message: String(error) }, { status: 500 });
   } finally {
     if (client) client.release();
   }

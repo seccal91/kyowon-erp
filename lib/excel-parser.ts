@@ -1,62 +1,119 @@
 import * as XLSX from "xlsx";
 
-export function cellToStr(v: unknown): string {
-  if (v === null || v === undefined) return "";
-  if (v instanceof Date) return v.toISOString().split("T")[0];
-  return String(v).trim();
-}
-
-export function cellToDate(v: unknown): string | null {
-  if (v === null || v === undefined || v === "") return null;
-  if (v instanceof Date) {
-    if (isNaN(v.getTime())) return null;
-    const y = v.getFullYear();
-    const m = String(v.getMonth() + 1).padStart(2, "0");
-    const d = String(v.getDate()).padStart(2, "0");
-    return `${y}-${m}-${d}`;
-  }
-  const s = String(v).trim();
-  const m = s.match(/(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
-  if (m) return `${m[1]}-${String(m[2]).padStart(2, "0")}-${String(m[3]).padStart(2, "0")}`;
-  if (/^\d{1,5}$/.test(s)) {
-    const d = XLSX.SSF.parse_date_code(Number(s));
-    if (d) return `${d.y}-${String(d.m).padStart(2, "0")}-${String(d.d).padStart(2, "0")}`;
-  }
-  return null;
-}
-
-export function cellToNum(v: unknown): number | null {
-  if (v === null || v === undefined || v === "") return null;
-  const n = Number(v);
-  return isNaN(n) ? null : n;
-}
+export type ExcelRow = Record<string, unknown>;
 
 export interface ParsedSheet {
   headers: string[];
-  rows: Record<string, unknown>[];
+  rows: ExcelRow[];
   missingRequired: string[];
 }
 
+function cleanHeader(value: unknown): string {
+  return String(value ?? "").trim().replace(/\s+/g, "");
+}
+
+export function cellToStr(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (value instanceof Date) return toIsoDate(value) ?? "";
+  return String(value).trim();
+}
+
+export function cellToDate(value: unknown): string | null {
+  if (value === null || value === undefined || value === "") return null;
+
+  if (value instanceof Date) return toIsoDate(value);
+
+  if (typeof value === "number") {
+    const decoded = XLSX.SSF.parse_date_code(value);
+    if (!decoded) return null;
+    return `${decoded.y}-${String(decoded.m).padStart(2, "0")}-${String(decoded.d).padStart(2, "0")}`;
+  }
+
+  const text = String(value).trim();
+  const normalized = text.replace(/[./]/g, "-");
+
+  const dashed = normalized.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (dashed) {
+    return `${dashed[1]}-${String(dashed[2]).padStart(2, "0")}-${String(dashed[3]).padStart(2, "0")}`;
+  }
+
+  const compact = text.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (compact) return `${compact[1]}-${compact[2]}-${compact[3]}`;
+
+  if (/^\d{1,5}$/.test(text)) {
+    const decoded = XLSX.SSF.parse_date_code(Number(text));
+    if (decoded) return `${decoded.y}-${String(decoded.m).padStart(2, "0")}-${String(decoded.d).padStart(2, "0")}`;
+  }
+
+  return null;
+}
+
+export function cellToNum(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  const num = Number(String(value).replace(/,/g, "").trim());
+  return Number.isFinite(num) ? num : null;
+}
+
 export function parseExcelByHeader(buffer: Buffer, requiredCols: string[]): ParsedSheet {
-  const wb = XLSX.read(buffer, { type: "buffer", cellDates: true });
-  const sheet = wb.Sheets[wb.SheetNames[0]];
-  const raw = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, defval: null });
+  const workbook = XLSX.read(buffer, { type: "buffer", cellDates: true });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  const rawRows = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, defval: null });
 
-  if (!raw.length) return { headers: [], rows: [], missingRequired: requiredCols };
+  if (!rawRows.length) return { headers: [], rows: [], missingRequired: requiredCols };
 
-  const headers = (raw[0] as unknown[]).map(h => String(h ?? "").trim());
-  const missing = requiredCols.filter(r => !headers.includes(r));
-  if (missing.length) return { headers, rows: [], missingRequired: missing };
+  const headers = (rawRows[0] as unknown[]).map(cleanHeader);
+  const headerSet = new Set(headers);
+  const missingRequired = requiredCols.filter((col) => !headerSet.has(cleanHeader(col)));
+  if (missingRequired.length) return { headers, rows: [], missingRequired };
 
-  const rows: Record<string, unknown>[] = [];
-  for (let i = 1; i < raw.length; i++) {
-    const r = raw[i] as unknown[];
-    // Skip fully empty rows
-    if (r.every(v => v === null || v === undefined || v === "")) continue;
-    const obj: Record<string, unknown> = {};
-    headers.forEach((h, j) => { if (h) obj[h] = r[j] ?? null; });
-    rows.push(obj);
+  const rows: ExcelRow[] = [];
+  for (let i = 1; i < rawRows.length; i++) {
+    const raw = rawRows[i] as unknown[];
+    if (!raw || raw.every((value) => value === null || value === undefined || value === "")) continue;
+
+    const row: ExcelRow = {};
+    headers.forEach((header, index) => {
+      if (header) row[header] = raw[index] ?? null;
+    });
+    rows.push(row);
   }
 
   return { headers, rows, missingRequired: [] };
+}
+
+export function pick(row: ExcelRow, aliases: string[]): unknown {
+  for (const alias of aliases) {
+    const key = cleanHeader(alias);
+    if (Object.prototype.hasOwnProperty.call(row, key)) return row[key];
+  }
+  return undefined;
+}
+
+export function normalizeOrderType(rawType: unknown, rawNewFlag?: unknown): string {
+  const text = cellToStr(rawType).replace(/\s+/g, "");
+  const newFlag = cellToStr(rawNewFlag).toUpperCase();
+
+  if (text.includes("초도")) return "초도";
+  if (text.includes("영업교재")) return "영업교재";
+  if (text.includes("정규")) return "정규";
+  if (text.includes("신규") || text.includes("복회")) {
+    if (newFlag === "Y") return "신규";
+    if (newFlag === "N") return "복회";
+    return text.includes("복회") && !text.includes("신규") ? "복회" : "신규";
+  }
+  return text || "정규";
+}
+
+export function isCancelled(value: unknown): boolean {
+  const text = cellToStr(value).toUpperCase();
+  return text.includes("취소완료") || text === "Y" || text === "YES" || text === "TRUE" || text === "1";
+}
+
+function toIsoDate(date: Date): string | null {
+  if (Number.isNaN(date.getTime())) return null;
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }

@@ -1,16 +1,30 @@
 "use client";
-import { useSession } from "next-auth/react";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+import { useSession } from "next-auth/react";
+import { useRouter } from "next/navigation";
+import { useEffect, useRef, useState } from "react";
+import * as XLSX from "xlsx";
 
 type Mode = "merchants" | "orders" | "branches";
 type Step = "idle" | "previewing" | "preview" | "confirming" | "done";
 
-interface PreviewRow { rowNum: number; key?: string; after: Record<string, any>; }
-interface UpdateRow { rowNum: number; key: string; before: Record<string, any>; after: Record<string, any>; changes: Record<string, { from: any; to: any }>; }
-interface ErrorRow { rowNum: number; reason: string; data: Record<string, any>; }
+interface PreviewRow {
+  rowNum: number;
+  key?: string;
+  after: Record<string, unknown>;
+}
+
+interface UpdateRow {
+  rowNum: number;
+  key: string;
+  changes: Record<string, { from: unknown; to: unknown }>;
+}
+
+interface ErrorRow {
+  rowNum: number;
+  reason: string;
+  data: Record<string, unknown>;
+}
 
 interface PreviewData {
   filename: string;
@@ -22,464 +36,505 @@ interface PreviewData {
   error_rows: ErrorRow[];
 }
 
-interface HistoryRow {
-  id: number; filename: string; mode: string; uploaded_at: string;
-  uploaded_by: string; total_rows: number; inserted: number;
-  updated: number; errors: number; skipped: number;
-}
-
 interface ConfirmResult {
-  ok: boolean; total_rows: number;
-  inserted: number; updated: number; errors: number; skipped: number;
+  ok: boolean;
+  total_rows: number;
+  inserted: number;
+  updated: number;
+  errors: number;
+  skipped: number;
 }
 
-// ─── Config ───────────────────────────────────────────────────────────────────
+interface HistoryRow {
+  id: number;
+  filename: string;
+  mode: string;
+  uploaded_at: string;
+  total_rows: number;
+  inserted: number;
+  updated: number;
+  errors: number;
+  skipped: number;
+}
 
-const TABS: { id: Mode; label: string; desc: string; required: string[]; hints: string[] }[] = [
-  {
-    id: "merchants",
-    label: "가맹점 등록",
-    desc: "가맹점 정보를 등록하거나 업데이트합니다.",
-    required: ["조직코드"],
-    hints: ["조직코드 ★", "교실명 ★(신규)", "주소", "계약일", "해지일자"],
-  },
-  {
-    id: "orders",
+const TABS: Record<Mode, { label: string; desc: string; columns: string[]; required: string[] }> = {
+  orders: {
     label: "주문 데이터",
-    desc: "주문 행 데이터를 등록합니다. 헤더명으로 컬럼을 인식합니다.",
-    required: ["가맹교실ID", "주문일", "수량"],
-    hints: ["가맹교실ID ★", "주문일 ★", "수량 ★", "주문구분", "신규여부", "학년", "취소여부"],
+    desc: "주문 계산에 필요한 최소 정보만 저장합니다. 원본 엑셀 파일과 개인정보 컬럼은 저장하지 않습니다.",
+    columns: ["조직코드", "주문일", "주문구분", "수량", "취소여부", "학년", "신규여부"],
+    required: ["조직코드", "주문일", "주문구분", "수량"],
   },
-  {
-    id: "branches",
+  merchants: {
+    label: "가맹점 등록",
+    desc: "가맹점 코드, 교실명, 주소, 계약일만 사용합니다. 주소는 지역 배정을 위해서만 읽습니다.",
+    columns: ["조직코드", "교실명", "주소", "계약일", "해지일자"],
+    required: ["조직코드"],
+  },
+  branches: {
     label: "지사 & 지역",
-    desc: "지사를 등록하거나 지역을 추가합니다.",
+    desc: "지사명과 지역 정보를 기준으로 지사를 등록하거나 지역을 추가합니다.",
+    columns: ["지사명", "대분류", "중분류"],
     required: ["지사명"],
-    hints: ["지사명 ★", "지역(대분류)", "중분류"],
   },
-];
-
-// ─── Styles ───────────────────────────────────────────────────────────────────
-
-const S = {
-  page: { padding: "24px 28px", background: "#f1f5f9", minHeight: "100vh" } as React.CSSProperties,
-  card: { background: "#fff", borderRadius: 16, boxShadow: "0 4px 24px rgba(15,23,42,0.07)", overflow: "hidden" } as React.CSSProperties,
-  cardHead: (color: string) => ({ padding: "14px 20px", background: color, fontWeight: 800, fontSize: 15, color: "#fff" } as React.CSSProperties),
-  cardBody: { padding: 20 } as React.CSSProperties,
-  th: { padding: "9px 12px", background: "#f8fafc", fontSize: 12, fontWeight: 700, color: "#475569", textAlign: "left" as const, borderBottom: "2px solid #e2e8f0", whiteSpace: "nowrap" as const },
-  td: { padding: "8px 12px", fontSize: 12, color: "#0f172a", borderBottom: "1px solid #f1f5f9", whiteSpace: "nowrap" as const },
 };
 
-function Btn({ label, color, onClick, disabled, size = "md" }: { label: string; color: string; onClick?: () => void; disabled?: boolean; size?: "sm" | "md" }) {
+const pageStyle: React.CSSProperties = {
+  padding: "24px 28px",
+  background: "#f1f5f9",
+  minHeight: "100vh",
+  color: "#0f172a",
+};
+
+const cardStyle: React.CSSProperties = {
+  background: "#ffffff",
+  borderRadius: 12,
+  boxShadow: "0 4px 24px rgba(15,23,42,0.07)",
+  overflow: "hidden",
+};
+
+const thStyle: React.CSSProperties = {
+  padding: "9px 12px",
+  background: "#f8fafc",
+  color: "#475569",
+  fontSize: 12,
+  fontWeight: 700,
+  borderBottom: "2px solid #e2e8f0",
+  textAlign: "left",
+  whiteSpace: "nowrap",
+};
+
+const tdStyle: React.CSSProperties = {
+  padding: "8px 12px",
+  color: "#0f172a",
+  fontSize: 12,
+  borderBottom: "1px solid #f1f5f9",
+  whiteSpace: "nowrap",
+};
+
+function Button({
+  children,
+  onClick,
+  disabled,
+  tone = "primary",
+}: {
+  children: React.ReactNode;
+  onClick?: () => void;
+  disabled?: boolean;
+  tone?: "primary" | "dark" | "muted";
+}) {
+  const color = tone === "primary" ? "#2563eb" : tone === "dark" ? "#0f172a" : "#64748b";
   return (
     <button
+      type="button"
       onClick={onClick}
       disabled={disabled}
       style={{
-        padding: size === "sm" ? "7px 16px" : "11px 24px",
-        borderRadius: 10, border: "none", fontWeight: 700,
-        fontSize: size === "sm" ? 13 : 14, cursor: disabled ? "not-allowed" : "pointer",
-        background: disabled ? "#cbd5e1" : color, color: "#fff",
+        border: "none",
+        borderRadius: 8,
+        padding: "10px 16px",
+        background: disabled ? "#cbd5e1" : color,
+        color: "#ffffff",
+        fontWeight: 700,
+        cursor: disabled ? "not-allowed" : "pointer",
       }}
     >
-      {label}
+      {children}
     </button>
   );
 }
 
-function StatBadge({ label, value, color }: { label: string; value: number; color: string }) {
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 16px", borderRadius: 10, background: color + "18", border: `1px solid ${color}30` }}>
-      <span style={{ fontSize: 22, fontWeight: 800, color }}>{value.toLocaleString()}</span>
-      <span style={{ fontSize: 13, color: "#475569" }}>{label}</span>
-    </div>
-  );
+function downloadTemplate(mode: Mode) {
+  const rows =
+    mode === "orders"
+      ? [
+          ["조직코드", "주문일", "주문구분", "수량", "취소여부", "학년", "신규여부"],
+          ["A12345", "2026-04-01", "정규", 1, "", "초3", ""],
+          ["A12345", "2026-04-02", "신규/복회", 1, "", "초4", "Y"],
+          ["A12345", "2026-04-03", "정규", 1, "취소완료", "초3", ""],
+        ]
+      : mode === "merchants"
+        ? [
+            ["조직코드", "교실명", "주소", "계약일", "해지일자"],
+            ["A12345", "서초교실", "서울특별시 서초구 ...", "2024-01-01", ""],
+          ]
+        : [
+            ["지사명", "대분류", "중분류"],
+            ["서부지사", "서울특별시", "서대문구"],
+          ];
+
+  const workbook = XLSX.utils.book_new();
+  const sheet = XLSX.utils.aoa_to_sheet(rows);
+  XLSX.utils.book_append_sheet(workbook, sheet, "업로드양식");
+  XLSX.writeFile(workbook, `${TABS[mode].label}_업로드양식.xlsx`);
 }
 
-// ─── Diff Cell ────────────────────────────────────────────────────────────────
-function DiffCell({ from, to }: { from: any; to: any }) {
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-      {from !== undefined && from !== null && from !== "" && (
-        <span style={{ fontSize: 11, color: "#dc2626", textDecoration: "line-through" }}>{String(from)}</span>
-      )}
-      <span style={{ fontSize: 12, color: "#15803d", fontWeight: 600 }}>{String(to ?? "")}</span>
-    </div>
-  );
-}
+function SmallTable({ rows, type }: { rows: PreviewRow[] | ErrorRow[]; type: "new" | "error" }) {
+  if (rows.length === 0) return <div style={{ padding: 16, color: "#94a3b8", fontSize: 13 }}>없음</div>;
+  const sample = rows[0] as any;
+  const keys = Object.keys(type === "error" ? sample.data ?? {} : sample.after ?? {});
 
-// ─── Preview Tables ───────────────────────────────────────────────────────────
-
-function NewTable({ rows, mode }: { rows: PreviewRow[]; mode: Mode }) {
-  if (!rows.length) return <p style={{ color: "#94a3b8", fontSize: 13 }}>없음</p>;
-  const keys = Object.keys(rows[0]?.after ?? {});
   return (
     <div style={{ overflowX: "auto" }}>
-      <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 500 }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 640 }}>
         <thead>
           <tr>
-            <th style={S.th}>행</th>
-            {mode !== "orders" && <th style={S.th}>코드/이름</th>}
-            {keys.map(k => <th key={k} style={S.th}>{k}</th>)}
+            <th style={thStyle}>행</th>
+            {type === "error" && <th style={thStyle}>오류 사유</th>}
+            {keys.map((key) => (
+              <th key={key} style={thStyle}>
+                {key}
+              </th>
+            ))}
           </tr>
         </thead>
         <tbody>
-          {rows.map(r => (
-            <tr key={r.rowNum}>
-              <td style={{ ...S.td, color: "#94a3b8" }}>{r.rowNum}</td>
-              {mode !== "orders" && <td style={{ ...S.td, fontWeight: 600 }}>{r.key}</td>}
-              {keys.map(k => <td key={k} style={S.td}>{String(r.after[k] ?? "")}</td>)}
-            </tr>
-          ))}
+          {rows.map((row: any) => {
+            const data = type === "error" ? row.data : row.after;
+            return (
+              <tr key={row.rowNum}>
+                <td style={{ ...tdStyle, color: "#64748b" }}>{row.rowNum}</td>
+                {type === "error" && <td style={{ ...tdStyle, color: "#dc2626", fontWeight: 700 }}>{row.reason}</td>}
+                {keys.map((key) => (
+                  <td key={key} style={tdStyle}>
+                    {String(data?.[key] ?? "")}
+                  </td>
+                ))}
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
   );
 }
 
-function UpdateTable({ rows }: { rows: UpdateRow[] }) {
-  if (!rows.length) return <p style={{ color: "#94a3b8", fontSize: 13 }}>없음</p>;
-  const changeKeys = [...new Set(rows.flatMap(r => Object.keys(r.changes)))];
-  return (
-    <div style={{ overflowX: "auto" }}>
-      <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 500 }}>
-        <thead>
-          <tr>
-            <th style={S.th}>행</th>
-            <th style={S.th}>코드/이름</th>
-            {changeKeys.map(k => <th key={k} style={{ ...S.th, background: "#fef9c3" }}>{k}</th>)}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map(r => (
-            <tr key={r.rowNum}>
-              <td style={{ ...S.td, color: "#94a3b8" }}>{r.rowNum}</td>
-              <td style={{ ...S.td, fontWeight: 600 }}>{r.key}</td>
-              {changeKeys.map(k => (
-                <td key={k} style={{ ...S.td, background: r.changes[k] ? "#fef9c330" : undefined }}>
-                  {r.changes[k]
-                    ? <DiffCell from={r.changes[k].from} to={r.changes[k].to} />
-                    : <span style={{ color: "#94a3b8" }}>—</span>}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function ErrorTable({ rows }: { rows: ErrorRow[] }) {
-  if (!rows.length) return <p style={{ color: "#94a3b8", fontSize: 13 }}>없음</p>;
-  return (
-    <div style={{ overflowX: "auto" }}>
-      <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 400 }}>
-        <thead>
-          <tr>
-            <th style={S.th}>행</th>
-            <th style={S.th}>오류 사유</th>
-            <th style={S.th}>데이터</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map(r => (
-            <tr key={r.rowNum}>
-              <td style={{ ...S.td, color: "#94a3b8" }}>{r.rowNum}</td>
-              <td style={{ ...S.td, color: "#dc2626", fontWeight: 600 }}>{r.reason}</td>
-              <td style={{ ...S.td, color: "#64748b", maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis" }}>
-                {Object.entries(r.data).slice(0, 4).map(([k, v]) => `${k}: ${v}`).join(" | ")}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-// ─── History Table ────────────────────────────────────────────────────────────
 function HistoryTable({ rows }: { rows: HistoryRow[] }) {
-  const modeLabel: Record<string, string> = { merchants: "가맹점", orders: "주문", branches: "지사" };
+  const modeLabel: Record<string, string> = { orders: "주문", merchants: "가맹점", branches: "지사" };
   return (
     <div style={{ overflowX: "auto" }}>
       <table style={{ width: "100%", borderCollapse: "collapse" }}>
         <thead>
           <tr>
-            {["업로드 일시", "파일명", "종류", "전체", "신규", "업데이트", "오류", "건너뜀"].map(h => (
-              <th key={h} style={S.th}>{h}</th>
+            {["일시", "파일명", "종류", "전체", "등록", "업데이트", "오류", "건너뜀"].map((header) => (
+              <th key={header} style={thStyle}>
+                {header}
+              </th>
             ))}
           </tr>
         </thead>
         <tbody>
-          {rows.length === 0 && (
-            <tr><td colSpan={8} style={{ ...S.td, textAlign: "center", color: "#94a3b8", padding: 24 }}>업로드 이력 없음</td></tr>
-          )}
-          {rows.map(r => (
-            <tr key={r.id}>
-              <td style={{ ...S.td, color: "#64748b" }}>{new Date(r.uploaded_at).toLocaleString("ko-KR")}</td>
-              <td style={{ ...S.td, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }}>{r.filename}</td>
-              <td style={S.td}>{modeLabel[r.mode] ?? r.mode}</td>
-              <td style={{ ...S.td, textAlign: "right" }}>{r.total_rows.toLocaleString()}</td>
-              <td style={{ ...S.td, textAlign: "right", color: "#15803d", fontWeight: 600 }}>{r.inserted.toLocaleString()}</td>
-              <td style={{ ...S.td, textAlign: "right", color: "#2563eb" }}>{r.updated.toLocaleString()}</td>
-              <td style={{ ...S.td, textAlign: "right", color: r.errors > 0 ? "#dc2626" : "#94a3b8" }}>{r.errors.toLocaleString()}</td>
-              <td style={{ ...S.td, textAlign: "right", color: "#94a3b8" }}>{r.skipped.toLocaleString()}</td>
+          {rows.length === 0 ? (
+            <tr>
+              <td colSpan={8} style={{ ...tdStyle, padding: 20, textAlign: "center", color: "#94a3b8" }}>
+                업로드 이력이 없습니다.
+              </td>
             </tr>
-          ))}
+          ) : (
+            rows.map((row) => (
+              <tr key={row.id}>
+                <td style={tdStyle}>{new Date(row.uploaded_at).toLocaleString("ko-KR")}</td>
+                <td style={tdStyle}>{row.filename}</td>
+                <td style={tdStyle}>{modeLabel[row.mode] ?? row.mode}</td>
+                <td style={{ ...tdStyle, textAlign: "right" }}>{row.total_rows.toLocaleString()}</td>
+                <td style={{ ...tdStyle, textAlign: "right", color: "#15803d", fontWeight: 700 }}>
+                  {row.inserted.toLocaleString()}
+                </td>
+                <td style={{ ...tdStyle, textAlign: "right", color: "#2563eb" }}>{row.updated.toLocaleString()}</td>
+                <td style={{ ...tdStyle, textAlign: "right", color: row.errors ? "#dc2626" : "#94a3b8" }}>
+                  {row.errors.toLocaleString()}
+                </td>
+                <td style={{ ...tdStyle, textAlign: "right", color: "#94a3b8" }}>{row.skipped.toLocaleString()}</td>
+              </tr>
+            ))
+          )}
         </tbody>
       </table>
     </div>
   );
 }
 
-// ─── Page ─────────────────────────────────────────────────────────────────────
 export default function UploadPage() {
   const { status } = useSession();
   const router = useRouter();
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const [mode, setMode] = useState<Mode>("merchants");
+  const [mode, setMode] = useState<Mode>("orders");
   const [file, setFile] = useState<File | null>(null);
-  const [dragging, setDragging] = useState(false);
   const [step, setStep] = useState<Step>("idle");
   const [preview, setPreview] = useState<PreviewData | null>(null);
-  const [confirmResult, setConfirmResult] = useState<ConfirmResult | null>(null);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [result, setResult] = useState<ConfirmResult | null>(null);
   const [history, setHistory] = useState<HistoryRow[]>([]);
+  const [message, setMessage] = useState<string | null>(null);
 
-  useEffect(() => { if (status === "unauthenticated") router.push("/auth/signin"); }, [status, router]);
-  useEffect(() => { fetchHistory(); }, []);
+  useEffect(() => {
+    if (status === "unauthenticated") router.push("/auth/signin");
+  }, [router, status]);
 
-  async function fetchHistory() {
-    try {
-      const r = await fetch("/api/upload/history");
-      if (r.ok) setHistory((await r.json()).history ?? []);
-    } catch {}
-  }
+  useEffect(() => {
+    fetch("/api/upload/history")
+      .then((res) => (res.ok ? res.json() : { history: [] }))
+      .then((data) => setHistory(data.history ?? []))
+      .catch(() => {});
+  }, [result]);
 
-  function reset() {
-    setFile(null); setStep("idle"); setPreview(null);
-    setConfirmResult(null); setErrorMsg(null);
+  function reset(nextMode = mode) {
+    setMode(nextMode);
+    setFile(null);
+    setStep("idle");
+    setPreview(null);
+    setResult(null);
+    setMessage(null);
     if (inputRef.current) inputRef.current.value = "";
   }
 
-  function changeMode(m: Mode) { setMode(m); reset(); }
-
-  function onFile(f: File) {
-    if (!f.name.match(/\.(xlsx|xls)$/i)) { setErrorMsg("Excel 파일(.xlsx/.xls)만 허용됩니다."); return; }
-    setFile(f); setStep("idle"); setPreview(null); setConfirmResult(null); setErrorMsg(null);
-  }
-
-  async function handlePreview() {
+  async function analyze() {
     if (!file) return;
-    setStep("previewing"); setErrorMsg(null);
-    const fd = new FormData();
-    fd.append("file", file);
-    fd.append("mode", mode);
+    setStep("previewing");
+    setMessage(null);
+
+    const formData = new FormData();
+    formData.append("mode", mode);
+    formData.append("file", file);
+
     try {
-      const res = await fetch("/api/upload/preview", { method: "POST", body: fd });
+      const res = await fetch("/api/upload/preview", { method: "POST", body: formData });
       const body = await res.json();
-      if (!res.ok) { setErrorMsg(body.message ?? "오류 발생"); setStep("idle"); return; }
+      if (!res.ok) {
+        setMessage(body.message ?? "파일 분석에 실패했습니다.");
+        setStep("idle");
+        return;
+      }
       setPreview(body);
       setStep("preview");
-    } catch (e) {
-      setErrorMsg("네트워크 오류"); setStep("idle");
-    }
-  }
-
-  async function handleConfirm() {
-    if (!file) return;
-    setStep("confirming"); setErrorMsg(null);
-    const fd = new FormData();
-    fd.append("file", file);
-    fd.append("mode", mode);
-    try {
-      const res = await fetch("/api/upload/confirm", { method: "POST", body: fd });
-      const body = await res.json();
-      if (!res.ok) { setErrorMsg(body.message ?? "오류 발생"); setStep("preview"); return; }
-      setConfirmResult(body);
-      setStep("done");
-      fetchHistory();
     } catch {
-      setErrorMsg("네트워크 오류"); setStep("preview");
+      setMessage("네트워크 오류가 발생했습니다.");
+      setStep("idle");
     }
   }
 
-  const tab = TABS.find(t => t.id === mode)!;
+  async function confirm() {
+    if (!file || !preview) return;
+    setStep("confirming");
+    setMessage(null);
 
-  if (status === "loading") return <div style={{ padding: 40 }}>Loading...</div>;
+    const formData = new FormData();
+    formData.append("mode", mode);
+    formData.append("file", file);
+
+    try {
+      const res = await fetch("/api/upload/confirm", { method: "POST", body: formData });
+      const body = await res.json();
+      if (!res.ok) {
+        setMessage(body.message ?? "DB 반영에 실패했습니다.");
+        setStep("preview");
+        return;
+      }
+      setResult(body);
+      setStep("done");
+    } catch {
+      setMessage("네트워크 오류가 발생했습니다.");
+      setStep("preview");
+    }
+  }
+
+  if (status === "loading") return <div style={{ padding: 40, color: "#0f172a" }}>Loading...</div>;
+
+  const tab = TABS[mode];
+  const canConfirm = Boolean(preview && (preview.stats.new > 0 || preview.stats.update > 0));
 
   return (
-    <div style={S.page}>
-      <div style={{ maxWidth: 1200, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
-
-        {/* Header */}
+    <div style={pageStyle}>
+      <div style={{ maxWidth: 1200, margin: "0 auto", display: "grid", gap: 20 }}>
         <div>
-          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: "#0f172a" }}>데이터 등록</h2>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: "#64748b" }}>
-            파일 분석 후 미리보기에서 변경사항을 확인하고 반영합니다.
+          <h2 style={{ margin: 0, fontSize: 22, color: "#0f172a" }}>데이터 등록</h2>
+          <p style={{ margin: "6px 0 0", color: "#64748b", fontSize: 13 }}>
+            엑셀을 분석한 뒤 미리보기에서 변경 내용을 확인하고 등록합니다.
           </p>
         </div>
 
-        {/* Mode tabs + File zone */}
-        <div style={S.card}>
-          {/* Tabs */}
-          <div style={{ display: "flex", borderBottom: "1px solid #e2e8f0" }}>
-            {TABS.map(t => (
-              <button key={t.id} onClick={() => changeMode(t.id)} style={{
-                padding: "13px 20px", border: "none", cursor: "pointer",
-                fontWeight: mode === t.id ? 700 : 500, fontSize: 14,
-                background: "transparent",
-                color: mode === t.id ? "#2563eb" : "#64748b",
-                borderBottom: mode === t.id ? "2px solid #2563eb" : "2px solid transparent",
-              }}>
-                {t.label}
+        <section style={cardStyle}>
+          <div style={{ display: "flex", borderBottom: "1px solid #e2e8f0", flexWrap: "wrap" }}>
+            {(Object.keys(TABS) as Mode[]).map((tabKey) => (
+              <button
+                key={tabKey}
+                type="button"
+                onClick={() => reset(tabKey)}
+                style={{
+                  padding: "13px 20px",
+                  border: "none",
+                  borderBottom: mode === tabKey ? "2px solid #2563eb" : "2px solid transparent",
+                  background: "transparent",
+                  color: mode === tabKey ? "#2563eb" : "#64748b",
+                  fontWeight: mode === tabKey ? 800 : 600,
+                  cursor: "pointer",
+                }}
+              >
+                {TABS[tabKey].label}
               </button>
             ))}
           </div>
 
-          <div style={S.cardBody}>
-            <p style={{ margin: "0 0 12px", fontSize: 13, color: "#475569" }}>{tab.desc}</p>
+          <div style={{ padding: 20, display: "grid", gap: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+              <div>
+                <div style={{ fontWeight: 800, marginBottom: 6 }}>{tab.label}</div>
+                <div style={{ color: "#64748b", fontSize: 13 }}>{tab.desc}</div>
+              </div>
+              <Button tone="muted" onClick={() => downloadTemplate(mode)}>
+                양식 다운로드
+              </Button>
+            </div>
 
-            {/* Column hints */}
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 16 }}>
-              {tab.hints.map(h => (
-                <span key={h} style={{
-                  fontSize: 12, padding: "4px 10px", borderRadius: 6,
-                  background: h.includes("★") ? "#eff6ff" : "#f8fafc",
-                  color: h.includes("★") ? "#2563eb" : "#64748b",
-                  border: h.includes("★") ? "1px solid #bfdbfe" : "1px solid #e2e8f0",
-                  fontWeight: h.includes("★") ? 700 : 400,
-                }}>
-                  {h}
-                </span>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {tab.columns.map((column) => {
+                const required = tab.required.includes(column);
+                return (
+                  <span
+                    key={column}
+                    style={{
+                      padding: "4px 10px",
+                      borderRadius: 999,
+                      border: required ? "1px solid #bfdbfe" : "1px solid #e2e8f0",
+                      background: required ? "#eff6ff" : "#f8fafc",
+                      color: required ? "#1d4ed8" : "#64748b",
+                      fontSize: 12,
+                      fontWeight: required ? 800 : 500,
+                    }}
+                  >
+                    {column}
+                    {required ? " 필수" : ""}
+                  </span>
+                );
+              })}
+            </div>
+
+            <label
+              style={{
+                display: "block",
+                border: "2px dashed #cbd5e1",
+                borderRadius: 12,
+                background: "#f8fafc",
+                padding: "30px 20px",
+                textAlign: "center",
+                cursor: "pointer",
+              }}
+            >
+              <input
+                ref={inputRef}
+                type="file"
+                accept=".xlsx,.xls"
+                style={{ display: "none" }}
+                onChange={(event) => {
+                  const nextFile = event.target.files?.[0] ?? null;
+                  if (!nextFile) return;
+                  if (!nextFile.name.match(/\.(xlsx|xls)$/i)) {
+                    setMessage("엑셀 파일(.xlsx/.xls)만 업로드할 수 있습니다.");
+                    return;
+                  }
+                  setFile(nextFile);
+                  setPreview(null);
+                  setResult(null);
+                  setStep("idle");
+                  setMessage(null);
+                }}
+              />
+              <div style={{ fontWeight: 800, color: file ? "#2563eb" : "#475569" }}>
+                {file ? file.name : "엑셀 파일 선택"}
+              </div>
+              <div style={{ marginTop: 4, color: "#94a3b8", fontSize: 12 }}>
+                파일은 서버에 보관하지 않고 필요한 컬럼만 추출합니다.
+              </div>
+            </label>
+
+            {message && (
+              <div
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 8,
+                  background: "#fef2f2",
+                  color: "#dc2626",
+                  border: "1px solid #fecaca",
+                  fontSize: 13,
+                }}
+              >
+                {message}
+              </div>
+            )}
+
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <Button tone="dark" onClick={analyze} disabled={!file || step === "previewing" || step === "confirming"}>
+                {step === "previewing" ? "분석 중..." : "파일 분석"}
+              </Button>
+              {(step === "preview" || step === "confirming") && (
+                <Button onClick={confirm} disabled={!canConfirm || step === "confirming"}>
+                  {step === "confirming" ? "등록 중..." : "확인 후 등록"}
+                </Button>
+              )}
+              {(step === "preview" || step === "done") && (
+                <Button tone="muted" onClick={() => reset()}>
+                  초기화
+                </Button>
+              )}
+            </div>
+          </div>
+        </section>
+
+        {preview && step !== "done" && (
+          <div style={{ display: "grid", gap: 16 }}>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              {[
+                ["전체", preview.total_rows, "#64748b"],
+                ["등록 대상", preview.stats.new, "#15803d"],
+                ["업데이트", preview.stats.update, "#2563eb"],
+                ["오류", preview.stats.error, "#dc2626"],
+                ["변경없음", preview.stats.skip, "#94a3b8"],
+              ].map(([label, value, color]) => (
+                <div key={String(label)} style={{ padding: "10px 16px", borderRadius: 10, background: `${color}18` }}>
+                  <b style={{ color: String(color), fontSize: 22 }}>{Number(value).toLocaleString()}</b>
+                  <span style={{ marginLeft: 8, color: "#475569", fontSize: 13 }}>{label}</span>
+                </div>
               ))}
             </div>
 
-            {/* Drop zone */}
-            <div
-              onClick={() => inputRef.current?.click()}
-              onDragOver={e => { e.preventDefault(); setDragging(true); }}
-              onDragLeave={() => setDragging(false)}
-              onDrop={e => { e.preventDefault(); setDragging(false); const f = e.dataTransfer.files?.[0]; if (f) onFile(f); }}
-              style={{
-                border: `2px dashed ${dragging ? "#2563eb" : "#cbd5e1"}`,
-                borderRadius: 12, padding: "32px 24px", textAlign: "center",
-                cursor: "pointer", background: dragging ? "#eff6ff" : "#f8fafc",
-                transition: "all 0.2s",
-              }}
-            >
-              <input ref={inputRef} type="file" accept=".xlsx,.xls" style={{ display: "none" }}
-                onChange={e => { const f = e.target.files?.[0]; if (f) onFile(f); }} />
-              {file ? (
-                <>
-                  <div style={{ color: "#2563eb", fontWeight: 700, fontSize: 15 }}>{file.name}</div>
-                  <div style={{ fontSize: 12, color: "#94a3b8", marginTop: 4 }}>다른 파일 선택 시 클릭</div>
-                </>
-              ) : (
-                <>
-                  <div style={{ color: "#64748b", fontSize: 14 }}>엑셀 파일을 드래그하거나 클릭하여 선택</div>
-                  <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 4 }}>.xlsx / .xls</div>
-                </>
-              )}
-            </div>
-
-            {errorMsg && (
-              <div style={{ marginTop: 12, padding: "10px 14px", borderRadius: 8, background: "#fef2f2", border: "1px solid #fecaca", color: "#dc2626", fontSize: 13 }}>
-                {errorMsg}
+            <section style={cardStyle}>
+              <div style={{ padding: "12px 18px", background: "#15803d", color: "#ffffff", fontWeight: 800 }}>
+                신규 등록 대상 {preview.stats.new.toLocaleString()}건
               </div>
-            )}
+              <SmallTable rows={preview.new_rows} type="new" />
+            </section>
 
-            {/* Action buttons */}
-            <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
-              {(step === "idle" || step === "previewing" || step === "preview") && (
-                <Btn label={step === "previewing" ? "분석 중..." : "파일 분석"} color="#0f172a"
-                  disabled={!file || step === "previewing"} onClick={handlePreview} />
-              )}
-              {(step === "preview" || step === "confirming") && preview && (
-                <Btn
-                  label={step === "confirming" ? "반영 중..." : `확인 및 반영 (신규 ${preview.stats.new} / 업데이트 ${preview.stats.update})`}
-                  color="#2563eb"
-                  disabled={step === "confirming" || (preview.stats.new === 0 && preview.stats.update === 0)}
-                  onClick={handleConfirm}
-                />
-              )}
-              {(step === "preview" || step === "done") && (
-                <Btn label="초기화" color="#64748b" size="sm" onClick={reset} />
-              )}
-            </div>
-          </div>
-        </div>
-
-        {/* Preview */}
-        {step === "preview" && preview && (
-          <>
-            {/* Stats */}
-            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-              <StatBadge label="전체 행" value={preview.total_rows} color="#64748b" />
-              <StatBadge label="신규 등록" value={preview.stats.new} color="#15803d" />
-              <StatBadge label="업데이트" value={preview.stats.update} color="#2563eb" />
-              <StatBadge label="오류" value={preview.stats.error} color="#dc2626" />
-              <StatBadge label="변경없음" value={preview.stats.skip} color="#94a3b8" />
-            </div>
-
-            {/* New rows */}
-            {preview.stats.new > 0 && (
-              <div style={S.card}>
-                <div style={S.cardHead("#15803d")}>
-                  신규 등록 대상 ({preview.stats.new.toLocaleString()}건
-                  {preview.stats.new > 200 ? " — 상위 200행 표시" : ""})
+            {preview.error_rows.length > 0 && (
+              <section style={cardStyle}>
+                <div style={{ padding: "12px 18px", background: "#dc2626", color: "#ffffff", fontWeight: 800 }}>
+                  오류 {preview.stats.error.toLocaleString()}건
                 </div>
-                <div style={S.cardBody}><NewTable rows={preview.new_rows} mode={mode} /></div>
-              </div>
+                <SmallTable rows={preview.error_rows} type="error" />
+              </section>
             )}
-
-            {/* Update rows */}
-            {preview.stats.update > 0 && (
-              <div style={S.card}>
-                <div style={S.cardHead("#2563eb")}>
-                  업데이트 대상 ({preview.stats.update.toLocaleString()}건
-                  {preview.stats.update > 200 ? " — 상위 200행 표시" : ""})
-                </div>
-                <div style={S.cardBody}><UpdateTable rows={preview.update_rows} /></div>
-              </div>
-            )}
-
-            {/* Error rows */}
-            {preview.stats.error > 0 && (
-              <div style={S.card}>
-                <div style={S.cardHead("#dc2626")}>
-                  오류 ({preview.stats.error.toLocaleString()}건
-                  {preview.stats.error > 200 ? " — 상위 200행 표시" : ""})
-                </div>
-                <div style={S.cardBody}><ErrorTable rows={preview.error_rows} /></div>
-              </div>
-            )}
-          </>
-        )}
-
-        {/* Done */}
-        {step === "done" && confirmResult && (
-          <div style={{ ...S.card, border: "1px solid #bbf7d0" }}>
-            <div style={S.cardHead("#15803d")}>반영 완료</div>
-            <div style={{ ...S.cardBody, display: "flex", gap: 16, flexWrap: "wrap" }}>
-              <StatBadge label="전체" value={confirmResult.total_rows} color="#64748b" />
-              <StatBadge label="신규 등록" value={confirmResult.inserted} color="#15803d" />
-              <StatBadge label="업데이트" value={confirmResult.updated} color="#2563eb" />
-              <StatBadge label="오류" value={confirmResult.errors} color="#dc2626" />
-              <StatBadge label="건너뜀" value={confirmResult.skipped} color="#94a3b8" />
-            </div>
           </div>
         )}
 
-        {/* Upload history */}
-        <div style={S.card}>
-          <div style={S.cardHead("#334155")}>업로드 이력 (최근 50건)</div>
-          <div style={S.cardBody}>
-            <HistoryTable rows={history} />
+        {step === "done" && result && (
+          <section style={{ ...cardStyle, border: "1px solid #bbf7d0" }}>
+            <div style={{ padding: "12px 18px", background: "#15803d", color: "#ffffff", fontWeight: 800 }}>
+              등록 완료
+            </div>
+            <div style={{ padding: 20, display: "flex", gap: 16, flexWrap: "wrap" }}>
+              <span>전체 {result.total_rows.toLocaleString()}건</span>
+              <b style={{ color: "#15803d" }}>등록 {result.inserted.toLocaleString()}건</b>
+              <b style={{ color: "#2563eb" }}>업데이트 {result.updated.toLocaleString()}건</b>
+              <b style={{ color: result.errors ? "#dc2626" : "#64748b" }}>오류 {result.errors.toLocaleString()}건</b>
+              <span style={{ color: "#64748b" }}>건너뜀 {result.skipped.toLocaleString()}건</span>
+            </div>
+          </section>
+        )}
+
+        <section style={cardStyle}>
+          <div style={{ padding: "12px 18px", background: "#334155", color: "#ffffff", fontWeight: 800 }}>
+            업로드 이력
           </div>
-        </div>
+          <HistoryTable rows={history} />
+        </section>
       </div>
     </div>
   );

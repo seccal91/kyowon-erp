@@ -1,16 +1,39 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getToken } from "next-auth/jwt";
 import pool from "../../../../lib/db";
-import { parseExcelByHeader, cellToStr, cellToDate, cellToNum } from "../../../../lib/excel-parser";
 import { parseAddress } from "../../../../lib/address-parser";
 import { REGION_MAP } from "../../../../lib/regions";
+import {
+  cellToDate,
+  cellToNum,
+  cellToStr,
+  isCancelled,
+  normalizeOrderType,
+  parseExcelByHeader,
+  pick,
+} from "../../../../lib/excel-parser";
 
 export const runtime = "nodejs";
 
-const MODE_REQUIRED: Record<string, string[]> = {
-  merchants: ["조직코드"],
-  orders:    ["가맹교실ID", "주문일", "수량"],
-  branches:  ["지사명"],
+type Mode = "merchants" | "orders" | "branches";
+
+const BASE_UNIT_PRICE = 32000;
+
+const ALIASES = {
+  merchantCode: ["조직코드", "가맹교실ID", "가맹점코드", "코드", "merchant_code", "code"],
+  merchantName: ["교실명", "가맹점명", "가맹교실명", "상호", "name"],
+  address: ["주소", "address"],
+  contractDate: ["계약일", "계약일자", "contract_date"],
+  terminationDate: ["해지일자", "해지일", "termination_date"],
+  orderDate: ["주문일", "주문일자", "주문연도월일", "order_date", "date"],
+  orderType: ["주문구분", "주문종류", "주문유형", "order_type", "type"],
+  quantity: ["수량", "주문수", "quantity", "qty"],
+  cancelled: ["취소여부", "취소", "cancelled"],
+  grade: ["학년", "grade"],
+  newFlag: ["신규여부", "신규", "new_flag"],
+  branchName: ["지사명", "branch", "branch_name"],
+  regionMajor: ["지역", "대분류", "시도", "major"],
+  regionMinor: ["중분류", "시군구", "minor"],
 };
 
 async function ensureHistory(client: any) {
@@ -30,243 +53,304 @@ async function ensureHistory(client: any) {
   `);
 }
 
-// ─── Confirm: merchants ───────────────────────────────────────────────────────
-async function confirmMerchants(rows: Record<string, unknown>[], client: any) {
+async function ensureOrders(client: any) {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id BIGSERIAL PRIMARY KEY,
+      source_id BIGINT,
+      merchant_code TEXT,
+      merchant_name TEXT,
+      year INT,
+      month INT,
+      major TEXT,
+      minor TEXT,
+      revenue NUMERIC DEFAULT 0,
+      quantity NUMERIC DEFAULT 0,
+      raw JSONB,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_date DATE`);
+  await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_type TEXT`);
+  await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS grade TEXT`);
+  await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancelled BOOLEAN DEFAULT FALSE`);
+}
+
+async function ensureMerchants(client: any) {
   await client.query(`
     CREATE TABLE IF NOT EXISTS merchants (
-      merchant_code TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT DEFAULT 'active',
-      contract_date DATE, termination_date DATE, created_at TIMESTAMP DEFAULT NOW()
+      merchant_code TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      status TEXT DEFAULT 'active',
+      contract_date DATE,
+      termination_date DATE,
+      created_at TIMESTAMP DEFAULT NOW()
     )
   `);
   await client.query(`
     CREATE TABLE IF NOT EXISTS merchant_mappings (
-      merchant_code TEXT PRIMARY KEY, org_id BIGINT, contract_date DATE,
-      member_count INT DEFAULT 0, major TEXT, minor TEXT, status TEXT DEFAULT 'active',
+      merchant_code TEXT PRIMARY KEY,
+      org_id BIGINT,
+      contract_date DATE,
+      member_count INT DEFAULT 0,
+      major TEXT,
+      minor TEXT,
+      status TEXT DEFAULT 'active',
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
   await client.query(`ALTER TABLE merchant_mappings ADD COLUMN IF NOT EXISTS major TEXT`);
   await client.query(`ALTER TABLE merchant_mappings ADD COLUMN IF NOT EXISTS minor TEXT`);
-
-  const orgsRes = await client.query(`SELECT id, regions FROM organizations`);
-  const regionToOrgId: Record<string, number> = {};
-  for (const org of orgsRes.rows) {
-    for (const r of (org.regions || [])) {
-      regionToOrgId[`${r.major}||${r.minor}`] = Number(org.id);
-    }
-  }
-
-  let inserted = 0, updated = 0, errors = 0, skipped = 0;
-
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    try {
-      const code = cellToStr(row["조직코드"]);
-      const name = cellToStr(row["교실명"] ?? row["가맹점명"] ?? null);
-      const address = cellToStr(row["주소"] ?? null);
-      const contractDate = cellToDate(row["계약일"]);
-      const termDate = cellToDate(row["해지일자"]);
-      const status = termDate ? "terminated" : "active";
-
-      if (!code) { errors++; continue; }
-
-      // Check existing
-      const ex = await client.query(`SELECT merchant_code FROM merchants WHERE merchant_code = $1`, [code]);
-      const isNew = ex.rows.length === 0;
-
-      if (isNew && !name) { errors++; continue; }
-
-      // Upsert merchant (only update non-null fields)
-      if (isNew) {
-        await client.query(
-          `INSERT INTO merchants (merchant_code, name, status, contract_date, termination_date)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [code, name, status, contractDate, termDate]
-        );
-        inserted++;
-      } else {
-        const sets: string[] = ["status = $2"];
-        const vals: any[] = [code, status];
-        if (name) { sets.push(`name = $${vals.length + 1}`); vals.push(name); }
-        if (contractDate) { sets.push(`contract_date = $${vals.length + 1}`); vals.push(contractDate); }
-        if (termDate) { sets.push(`termination_date = $${vals.length + 1}`); vals.push(termDate); }
-        await client.query(`UPDATE merchants SET ${sets.join(", ")} WHERE merchant_code = $1`, vals);
-        updated++;
-      }
-
-      // Resolve org from address
-      let major: string | null = null, minor: string | null = null, orgId: number | null = null;
-      if (address) {
-        const parsed = parseAddress(address);
-        if (parsed?.major && parsed?.minor) {
-          major = parsed.major; minor = parsed.minor;
-          orgId = regionToOrgId[`${major}||${minor}`] ?? null;
-        }
-      }
-
-      if (orgId || isNew) {
-        await client.query(
-          `INSERT INTO merchant_mappings (merchant_code, org_id, major, minor, contract_date, status)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           ON CONFLICT (merchant_code) DO UPDATE
-           SET org_id = COALESCE(EXCLUDED.org_id, merchant_mappings.org_id),
-               major = COALESCE(EXCLUDED.major, merchant_mappings.major),
-               minor = COALESCE(EXCLUDED.minor, merchant_mappings.minor),
-               contract_date = COALESCE(EXCLUDED.contract_date, merchant_mappings.contract_date),
-               status = EXCLUDED.status`,
-          [code, orgId, major, minor, contractDate, status]
-        );
-      }
-    } catch { errors++; }
-  }
-
-  return { inserted, updated, errors, skipped };
+  await client.query(`ALTER TABLE merchant_mappings ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'`);
 }
 
-// ─── Confirm: orders ──────────────────────────────────────────────────────────
 async function confirmOrders(rows: Record<string, unknown>[], client: any) {
-  await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_date DATE`);
-  await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_type TEXT`);
-  await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS grade TEXT`);
-  await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancelled BOOLEAN DEFAULT FALSE`);
+  await ensureOrders(client);
 
-  let inserted = 0, errors = 0, skipped = 0;
+  let inserted = 0;
+  let errors = 0;
+  let skipped = 0;
 
   for (const row of rows) {
     try {
-      const code = cellToStr(row["가맹교실ID"]);
-      const orderDate = cellToDate(row["주문일"]);
-      const qty = cellToNum(row["수량"]);
-      const orderTypeRaw = cellToStr(row["주문구분"]);
-      const isNew = cellToStr(row["신규여부"]).toUpperCase();
-      const cancelRaw = cellToStr(row["취소여부"]);
-      const grade = cellToStr(row["학년"]) || null;
+      const merchantCode = cellToStr(pick(row, ALIASES.merchantCode));
+      const orderDate = cellToDate(pick(row, ALIASES.orderDate));
+      const quantity = cellToNum(pick(row, ALIASES.quantity));
+      const rawType = pick(row, ALIASES.orderType);
+      const orderType = normalizeOrderType(rawType, pick(row, ALIASES.newFlag));
+      const grade = cellToStr(pick(row, ALIASES.grade)) || null;
+      const cancelled = isCancelled(pick(row, ALIASES.cancelled));
 
-      if (!code || !orderDate || qty === null || qty === 0) { skipped++; continue; }
+      if (!merchantCode || !orderDate || quantity === null || quantity === 0 || !cellToStr(rawType)) {
+        skipped++;
+        continue;
+      }
 
-      let orderType: string;
-      if (orderTypeRaw === "초도") orderType = "초도";
-      else if (orderTypeRaw === "영업교재") orderType = "영업교재";
-      else if (orderTypeRaw === "정규") orderType = "정규";
-      else if (orderTypeRaw === "신규복회" || orderTypeRaw === "신규/복회") {
-        orderType = isNew === "Y" ? "신규" : "복회";
-      } else orderType = orderTypeRaw || "정규";
-
-      const cancelled = cancelRaw === "취소완료";
-      const d = new Date(orderDate);
-      const year = d.getFullYear();
-      const month = d.getMonth() + 1;
+      const date = new Date(`${orderDate}T00:00:00`);
+      const year = date.getFullYear();
+      const month = date.getMonth() + 1;
 
       await client.query(
-        `INSERT INTO orders (merchant_code, order_date, year, month, order_type, grade, quantity, cancelled)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [code, orderDate, year, month, orderType, grade, qty, cancelled]
+        `INSERT INTO orders (
+           merchant_code, order_date, year, month, order_type, grade, revenue, quantity, cancelled
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [merchantCode, orderDate, year, month, orderType, grade, Number(quantity) * BASE_UNIT_PRICE, quantity, cancelled]
       );
       inserted++;
-    } catch { errors++; }
+    } catch (error) {
+      console.error("order confirm row error:", error);
+      errors++;
+    }
   }
 
   return { inserted, updated: 0, errors, skipped };
 }
 
-// ─── Confirm: branches ────────────────────────────────────────────────────────
-async function confirmBranches(rows: Record<string, unknown>[], client: any) {
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS organizations (
-      id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL,
-      regions JSONB DEFAULT '[]'::jsonb, group_name TEXT DEFAULT '예외',
-      created_at TIMESTAMP DEFAULT NOW()
-    )
-  `);
+async function confirmMerchants(rows: Record<string, unknown>[], client: any) {
+  await ensureMerchants(client);
 
-  let inserted = 0, updated = 0, errors = 0, skipped = 0;
+  const orgsRes = await client.query(`SELECT id, regions FROM organizations`);
+  const regionToOrgId: Record<string, number> = {};
+  for (const org of orgsRes.rows) {
+    for (const region of org.regions || []) {
+      regionToOrgId[`${region.major}||${region.minor}`] = Number(org.id);
+    }
+  }
+
+  let inserted = 0;
+  let updated = 0;
+  let errors = 0;
+  let skipped = 0;
 
   for (const row of rows) {
     try {
-      const name = cellToStr(row["지사명"]);
-      const regionRaw = cellToStr(row["지역"] ?? row["대분류"] ?? null);
-      const minorRaw = cellToStr(row["중분류"] ?? null);
-      if (!name) { errors++; continue; }
+      const code = cellToStr(pick(row, ALIASES.merchantCode));
+      const name = cellToStr(pick(row, ALIASES.merchantName));
+      const address = cellToStr(pick(row, ALIASES.address));
+      const contractDate = cellToDate(pick(row, ALIASES.contractDate));
+      const terminationDate = cellToDate(pick(row, ALIASES.terminationDate));
+      const status = terminationDate ? "terminated" : "active";
 
-      let major = "", minor: string | null = null;
-      if (regionRaw) {
-        for (const key of Object.keys(REGION_MAP)) {
-          if (regionRaw.includes(key) || key.includes(regionRaw)) { major = key; break; }
-        }
-        minor = minorRaw || null;
+      if (!code) {
+        errors++;
+        continue;
       }
 
-      const ex = await client.query(`SELECT id, regions FROM organizations WHERE name = $1`, [name]);
-      if (ex.rows.length === 0) {
-        const regionArr = major ? [{ major, minor }] : [];
+      const existing = await client.query(`SELECT merchant_code FROM merchants WHERE merchant_code = $1`, [code]);
+      const isNew = existing.rows.length === 0;
+      if (isNew && !name) {
+        errors++;
+        continue;
+      }
+
+      if (isNew) {
         await client.query(
-          `INSERT INTO organizations (name, regions, group_name) VALUES ($1, $2, '예외')`,
-          [name, JSON.stringify(regionArr)]
+          `INSERT INTO merchants (merchant_code, name, status, contract_date, termination_date)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [code, name, status, contractDate, terminationDate]
         );
         inserted++;
-      } else if (major) {
-        const org = ex.rows[0];
-        const regs: any[] = org.regions ?? [];
-        const has = regs.some((r: any) => r.major === major && r.minor === minor);
-        if (!has) {
-          regs.push({ major, minor });
-          await client.query(`UPDATE organizations SET regions = $1 WHERE id = $2`, [JSON.stringify(regs), org.id]);
-          updated++;
-        } else { skipped++; }
-      } else { skipped++; }
-    } catch { errors++; }
+      } else {
+        const sets = ["status = $2"];
+        const values: unknown[] = [code, status];
+        if (name) {
+          sets.push(`name = $${values.length + 1}`);
+          values.push(name);
+        }
+        if (contractDate) {
+          sets.push(`contract_date = $${values.length + 1}`);
+          values.push(contractDate);
+        }
+        if (terminationDate) {
+          sets.push(`termination_date = $${values.length + 1}`);
+          values.push(terminationDate);
+        }
+        await client.query(`UPDATE merchants SET ${sets.join(", ")} WHERE merchant_code = $1`, values);
+        updated++;
+      }
+
+      let major: string | null = null;
+      let minor: string | null = null;
+      let orgId: number | null = null;
+      if (address) {
+        const parsed = parseAddress(address);
+        if (parsed?.major && parsed?.minor) {
+          major = parsed.major;
+          minor = parsed.minor;
+          orgId = regionToOrgId[`${major}||${minor}`] ?? null;
+        }
+      }
+
+      await client.query(
+        `INSERT INTO merchant_mappings (merchant_code, org_id, major, minor, contract_date, status)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (merchant_code) DO UPDATE SET
+           org_id = COALESCE(EXCLUDED.org_id, merchant_mappings.org_id),
+           major = COALESCE(EXCLUDED.major, merchant_mappings.major),
+           minor = COALESCE(EXCLUDED.minor, merchant_mappings.minor),
+           contract_date = COALESCE(EXCLUDED.contract_date, merchant_mappings.contract_date),
+           status = EXCLUDED.status`,
+        [code, orgId, major, minor, contractDate, status]
+      );
+    } catch (error) {
+      console.error("merchant confirm row error:", error);
+      errors++;
+    }
   }
 
   return { inserted, updated, errors, skipped };
 }
 
-// ─── Route ────────────────────────────────────────────────────────────────────
+async function confirmBranches(rows: Record<string, unknown>[], client: any) {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS organizations (
+      id BIGSERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      regions JSONB DEFAULT '[]'::jsonb,
+      group_name TEXT DEFAULT '예외',
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  let inserted = 0;
+  let updated = 0;
+  let errors = 0;
+  let skipped = 0;
+
+  for (const row of rows) {
+    try {
+      const name = cellToStr(pick(row, ALIASES.branchName));
+      const majorRaw = cellToStr(pick(row, ALIASES.regionMajor));
+      const minor = cellToStr(pick(row, ALIASES.regionMinor)) || null;
+      if (!name) {
+        errors++;
+        continue;
+      }
+
+      const major = Object.keys(REGION_MAP).find((region) => majorRaw.includes(region) || region.includes(majorRaw)) || "";
+      const existing = await client.query(`SELECT id, regions FROM organizations WHERE name = $1`, [name]);
+      const regionArray = major ? [{ major, minor }] : [];
+
+      if (existing.rows.length === 0) {
+        await client.query(`INSERT INTO organizations (name, regions, group_name) VALUES ($1, $2, '예외')`, [
+          name,
+          JSON.stringify(regionArray),
+        ]);
+        inserted++;
+      } else if (regionArray.length > 0) {
+        const current = existing.rows[0].regions ?? [];
+        const hasRegion = current.some((region: any) => region.major === major && region.minor === minor);
+        if (hasRegion) {
+          skipped++;
+        } else {
+          current.push({ major, minor });
+          await client.query(`UPDATE organizations SET regions = $1 WHERE id = $2`, [
+            JSON.stringify(current),
+            existing.rows[0].id,
+          ]);
+          updated++;
+        }
+      } else {
+        skipped++;
+      }
+    } catch (error) {
+      console.error("branch confirm row error:", error);
+      errors++;
+    }
+  }
+
+  return { inserted, updated, errors, skipped };
+}
+
 export async function POST(req: NextRequest) {
   const token = await getToken({ req, secret: process.env.NEXTAUTH_SECRET });
   if (!token) return NextResponse.json({ message: "권한 없음" }, { status: 401 });
 
   let client;
   try {
-    const fd = await req.formData();
-    const file = fd.get("file");
-    const mode = String(fd.get("mode") || "");
+    const formData = await req.formData();
+    const file = formData.get("file");
+    const mode = String(formData.get("mode") || "") as Mode;
 
-    if (!file || !(file instanceof File)) return NextResponse.json({ message: "파일 없음" }, { status: 400 });
-    if (!MODE_REQUIRED[mode]) return NextResponse.json({ message: "mode 오류" }, { status: 400 });
+    if (!file || !(file instanceof File)) return NextResponse.json({ message: "파일이 없습니다." }, { status: 400 });
+    if (!["merchants", "orders", "branches"].includes(mode)) {
+      return NextResponse.json({ message: "업로드 종류가 올바르지 않습니다." }, { status: 400 });
+    }
 
     const buffer = Buffer.from(await file.arrayBuffer());
-    const { rows, missingRequired } = parseExcelByHeader(buffer, MODE_REQUIRED[mode]);
-
-    if (missingRequired.length) {
-      return NextResponse.json({ message: `필수 컬럼 없음: ${missingRequired.join(", ")}` }, { status: 400 });
-    }
-    if (!rows.length) return NextResponse.json({ message: "데이터 없음" }, { status: 400 });
+    const { rows } = parseExcelByHeader(buffer, []);
+    if (rows.length === 0) return NextResponse.json({ message: "데이터 행이 없습니다." }, { status: 400 });
 
     client = await pool.connect();
     await ensureHistory(client);
 
-    let stats: any;
-    if (mode === "merchants") stats = await confirmMerchants(rows, client);
-    else if (mode === "orders") stats = await confirmOrders(rows, client);
-    else stats = await confirmBranches(rows, client);
+    const stats =
+      mode === "orders"
+        ? await confirmOrders(rows, client)
+        : mode === "merchants"
+          ? await confirmMerchants(rows, client)
+          : await confirmBranches(rows, client);
 
-    // Log history
-    const histRes = await client.query(
+    const history = await client.query(
       `INSERT INTO upload_history (filename, mode, uploaded_by, total_rows, inserted, updated, errors, skipped)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-      [file.name, mode, token.email || token.name || "admin",
-       rows.length, stats.inserted, stats.updated, stats.errors, stats.skipped]
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id`,
+      [
+        file.name,
+        mode,
+        token.email || token.name || "admin",
+        rows.length,
+        stats.inserted,
+        stats.updated,
+        stats.errors,
+        stats.skipped,
+      ]
     );
 
-    return NextResponse.json({
-      ok: true,
-      history_id: histRes.rows[0]?.id,
-      total_rows: rows.length,
-      ...stats,
-    });
-  } catch (err) {
-    console.error("confirm error:", err);
-    return NextResponse.json({ message: String(err) }, { status: 500 });
+    return NextResponse.json({ ok: true, history_id: history.rows[0]?.id, total_rows: rows.length, ...stats });
+  } catch (error) {
+    console.error("upload confirm error:", error);
+    return NextResponse.json({ message: String(error) }, { status: 500 });
   } finally {
     if (client) client.release();
   }
