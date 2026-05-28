@@ -67,6 +67,11 @@ function legacyOrderRowsFromMatrix(buffer: Buffer) {
   return rows;
 }
 
+function hasAnyHeader(headers: string[], aliases: string[]) {
+  const headerSet = new Set(headers.map((header) => header.replace(/\s+/g, "")));
+  return aliases.some((alias) => headerSet.has(alias.replace(/\s+/g, "")));
+}
+
 async function ensureHistory(client: any) {
   await client.query(`
     CREATE TABLE IF NOT EXISTS upload_history (
@@ -349,8 +354,17 @@ export async function POST(req: NextRequest) {
     }
 
     const buffer = Buffer.from(await file.arrayBuffer());
-    let { rows } = parseExcelByHeader(buffer, []);
-    if (mode === "orders") {
+    const parsed = parseExcelByHeader(buffer, []);
+    let rows = parsed.rows;
+    if (
+      mode === "orders" &&
+      !(
+        hasAnyHeader(parsed.headers, ALIASES.merchantCode) &&
+        hasAnyHeader(parsed.headers, ALIASES.orderDate) &&
+        hasAnyHeader(parsed.headers, ALIASES.orderType) &&
+        hasAnyHeader(parsed.headers, ALIASES.quantity)
+      )
+    ) {
       const legacyRows = legacyOrderRowsFromMatrix(buffer);
       if (legacyRows.length > 0) rows = legacyRows;
     }
